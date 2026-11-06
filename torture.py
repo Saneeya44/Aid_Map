@@ -107,45 +107,149 @@ def decode_dump(text):
     return entries
 
 
+def _decode_oracle_bytes(value, field_name, maximum_length):
+    if not isinstance(value, str):
+        raise ValueError("{} is not a Base64 string".format(field_name))
+    decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    if base64.b64encode(decoded).decode("ascii") != value:
+        raise ValueError("{} is not canonical Base64".format(field_name))
+    if len(decoded) > maximum_length:
+        raise ValueError("{} exceeds the protocol limit".format(field_name))
+    return decoded
+
+
+def _valid_oracle_id(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value != "-"
+        and value.isascii()
+        and all(character.isprintable() and not character.isspace() for character in value)
+    )
+
+
+def _validated_operation(operation):
+    if not isinstance(operation, dict):
+        raise ValueError("Operation is not an object")
+
+    operation_type = operation.get("op")
+    if operation_type == "put":
+        if set(operation) != {"op", "key", "value"}:
+            raise ValueError("PUT operation has invalid fields")
+        key = _decode_oracle_bytes(operation["key"], "key", 1024)
+        value = _decode_oracle_bytes(operation["value"], "value", 1024 * 1024)
+        if not key:
+            raise ValueError("PUT key is empty")
+        return "put", key, value
+
+    if operation_type == "delete":
+        if set(operation) != {"op", "key"}:
+            raise ValueError("DELETE operation has invalid fields")
+        key = _decode_oracle_bytes(operation["key"], "key", 1024)
+        if not key:
+            raise ValueError("DELETE key is empty")
+        return "delete", key
+
+    raise ValueError("Unsupported oracle operation: {}".format(operation_type))
+
+
 def apply_request(state, request):
-    operation = request["op"]
+    if not isinstance(request, dict):
+        raise ValueError("Request is not an object")
+
+    operation = request.get("op")
     if operation == "put":
-        state[base64.b64decode(request["key"])] = base64.b64decode(
-            request["value"]
-        )
+        if set(request) != {"id", "op", "key", "value"}:
+            raise ValueError("PUT request has invalid fields")
+        validated = _validated_operation({
+            "op": operation,
+            "key": request["key"],
+            "value": request["value"],
+        })
+        state[validated[1]] = validated[2]
     elif operation == "delete":
-        state.pop(base64.b64decode(request["key"]), None)
+        if set(request) != {"id", "op", "key"}:
+            raise ValueError("DELETE request has invalid fields")
+        validated = _validated_operation({
+            "op": operation,
+            "key": request["key"],
+        })
+        state.pop(validated[1], None)
     elif operation == "batch":
-        for item in request["operations"]:
-            if item["op"] == "put":
-                state[base64.b64decode(item["key"])] = base64.b64decode(
-                    item["value"]
-                )
+        if set(request) != {"id", "op", "operations"}:
+            raise ValueError("BATCH request has invalid fields")
+        operations = request["operations"]
+        if not isinstance(operations, list) or not 1 <= len(operations) <= 10000:
+            raise ValueError("BATCH request has an invalid operation count")
+
+        # Validate the whole atomic request before applying any item.
+        validated_operations = [_validated_operation(item) for item in operations]
+        for item in validated_operations:
+            if item[0] == "put":
+                state[item[1]] = item[2]
             else:
-                state.pop(base64.b64decode(item["key"]), None)
+                state.pop(item[1], None)
     else:
         raise ValueError("Unsupported oracle operation: {}".format(operation))
 
 
 def verify_oracle(attempts, responses, actual_state):
-    """Return (PASS|FAIL|INCONCLUSIVE, candidate states, explanation)."""
-    id_to_index = {
-        event["request"]["id"]: index for index, event in enumerate(attempts)
-    }
+    """Verify against the exact sent order; the initial database is empty."""
+    if not isinstance(actual_state, dict) or any(
+        not isinstance(key, bytes) or not isinstance(value, bytes)
+        for key, value in actual_state.items()
+    ):
+        return "INCONCLUSIVE", [], "recovered state is not a bytes-to-bytes mapping"
 
-    for operation_id, (response_type, reason) in responses.items():
+    id_to_index = {}
+    for index, event in enumerate(attempts):
+        if not isinstance(event, dict) or event.get("sequence") != index:
+            return "INCONCLUSIVE", [], "request history has an invalid sequence"
+        request = event.get("request")
+        if not isinstance(request, dict):
+            return "INCONCLUSIVE", [], "request history contains an invalid request"
+        operation_id = request.get("id")
+        if not _valid_oracle_id(operation_id):
+            return "INCONCLUSIVE", [], "request history contains an invalid ID"
+        if operation_id in id_to_index:
+            return "INCONCLUSIVE", [], "duplicate operation ID {}".format(operation_id)
+        id_to_index[operation_id] = index
+
+    if not isinstance(responses, dict):
+        return "INCONCLUSIVE", [], "response history is invalid"
+
+    for operation_id, response in responses.items():
+        if (
+            not isinstance(operation_id, str)
+            or not isinstance(response, (list, tuple))
+            or len(response) != 2
+        ):
+            return "INCONCLUSIVE", [], "response history is malformed"
+        response_type, reason = response
         if operation_id not in id_to_index:
             return "INCONCLUSIVE", [], "response for unknown operation id {}".format(
+                operation_id
+            )
+        if response_type not in ("ACK", "ERR") or not isinstance(reason, str):
+            return "INCONCLUSIVE", [], "invalid response for {}".format(operation_id)
+        if (
+            (response_type == "ACK" and reason)
+            or (response_type == "ERR" and not reason)
+        ):
+            return "INCONCLUSIVE", [], "invalid response reason for {}".format(
                 operation_id
             )
         if response_type == "ERR":
             return "INCONCLUSIVE", [], "database returned ERR: {}".format(reason)
 
-    acknowledged = sorted(
-        id_to_index[operation_id]
-        for operation_id, (response_type, _) in responses.items()
-        if response_type == "ACK"
-    )
+    try:
+        acknowledged = sorted(
+            id_to_index[operation_id]
+            for operation_id, (response_type, _) in responses.items()
+            if response_type == "ACK"
+        )
+    except (TypeError, ValueError):
+        return "INCONCLUSIVE", [], "response history is malformed"
     ack_prefix = len(acknowledged)
     if acknowledged != list(range(ack_prefix)):
         return "INCONCLUSIVE", [], "ACKs do not form the serialized request prefix"
@@ -159,20 +263,109 @@ def verify_oracle(attempts, responses, actual_state):
         prefix_lengths.add(ack_prefix + 1)
 
     candidates = []
-    for prefix_length in sorted(prefix_lengths):
-        state = {}
-        for event in attempts[:prefix_length]:
-            apply_request(state, event["request"])
-        if state not in candidates:
-            candidates.append(state)
+    try:
+        for prefix_length in sorted(prefix_lengths):
+            state = {}
+            for event in attempts[:prefix_length]:
+                apply_request(state, event["request"])
+            if state not in candidates:
+                candidates.append(state)
+    except (KeyError, TypeError, ValueError, UnicodeEncodeError):
+        return "INCONCLUSIVE", [], "request history contains invalid operation data"
 
     if actual_state in candidates:
         return "PASS", candidates, "recovered state matches an allowed serialized prefix"
     return "FAIL", candidates, "recovered state matches no allowed serialized prefix"
 
 
+def verify_oracle_events(events, actual_state):
+    """Verify using request, successful-send, and response events from the log."""
+    if not isinstance(events, list):
+        return "INCONCLUSIVE", [], "oracle log is not an event list"
+
+    requests = {}
+    sent = {}
+    responses = {}
+    for event in events:
+        if not isinstance(event, dict):
+            return "INCONCLUSIVE", [], "oracle log contains a malformed event"
+        event_type = event.get("event")
+        operation_id = event.get("id")
+        if event_type == "request":
+            request = event.get("request")
+            sequence = event.get("sequence")
+            operation_id = request.get("id") if isinstance(request, dict) else None
+            if (
+                not isinstance(request, dict)
+                or not _valid_oracle_id(operation_id)
+                or request.get("id") != operation_id
+                or not isinstance(sequence, int)
+                or sequence < 0
+                or operation_id in requests
+            ):
+                return "INCONCLUSIVE", [], "oracle log contains an invalid request event"
+            requests[operation_id] = (sequence, request)
+        elif event_type == "sent":
+            sequence = event.get("sequence")
+            if (
+                not isinstance(operation_id, str)
+                or not isinstance(sequence, int)
+                or operation_id in sent
+            ):
+                return "INCONCLUSIVE", [], "oracle log contains an invalid sent event"
+            sent[operation_id] = sequence
+        elif event_type == "response":
+            response_type = event.get("response")
+            reason = event.get("reason")
+            if (
+                not isinstance(operation_id, str)
+                or response_type not in ("ACK", "ERR")
+                or not isinstance(reason, str)
+                or (response_type == "ACK" and reason)
+                or (response_type == "ERR" and not reason)
+                or operation_id in responses
+            ):
+                return "INCONCLUSIVE", [], "oracle log contains an invalid response event"
+            responses[operation_id] = (response_type, reason)
+        elif event_type == "send_error":
+            return "INCONCLUSIVE", [], "a request write to SERVE failed"
+        elif event_type not in ("kill", "verification"):
+            return "INCONCLUSIVE", [], "oracle log contains an unknown event"
+
+    if set(requests) != set(sent):
+        return "INCONCLUSIVE", [], "not every logged request has a confirmed send"
+    if any(operation_id not in requests for operation_id in responses):
+        return "INCONCLUSIVE", [], "response exists for an unknown request"
+
+    ordered = sorted(
+        ((sequence, operation_id, request) for operation_id, (sequence, request) in requests.items()),
+        key=lambda item: item[0],
+    )
+    if [item[0] for item in ordered] != list(range(len(ordered))):
+        return "INCONCLUSIVE", [], "oracle request sequence has gaps or duplicates"
+    for sequence, operation_id, _ in ordered:
+        if sent[operation_id] != sequence:
+            return "INCONCLUSIVE", [], "sent order differs from request order"
+
+    attempts = [
+        {"sequence": sequence, "request": request}
+        for sequence, _, request in ordered
+    ]
+    return verify_oracle(attempts, responses, actual_state)
+
+
+def verify_oracle_log(path, actual_state):
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            events = [json.loads(line) for line in file]
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return "INCONCLUSIVE", [], "could not read durable oracle log: {}".format(error)
+    return verify_oracle_events(events, actual_state)
+
+
 class OracleLog:
     def __init__(self, path):
+        self.path = path
         self.file = open(path, "x", encoding="utf-8")
         self.lock = threading.Lock()
 
@@ -481,8 +674,17 @@ class IterationRunner:
             self.process.wait(timeout=PROCESS_TIMEOUT)
         except subprocess.TimeoutExpired as error:
             raise HarnessError("Could not reap killed SERVE process") from error
+        for writer in self.writers:
+            writer.join(timeout=READER_TIMEOUT)
+            if writer.is_alive():
+                raise HarnessError("Writer thread did not stop after force-kill")
         if self.process.stdin and not self.process.stdin.closed:
-            self.process.stdin.close()
+            try:
+                self.process.stdin.close()
+            except OSError as error:
+                self.writer_errors.append(
+                    "closing SERVE stdin after force-kill: {}".format(error)
+                )
         self.stdout_thread.join(timeout=READER_TIMEOUT)
         self.stderr_thread.join(timeout=READER_TIMEOUT)
         if self.stdout_thread.is_alive() or self.stderr_thread.is_alive():
@@ -541,7 +743,7 @@ class IterationRunner:
 
         if self.reader_errors:
             return {
-                "result": "FAIL",
+                "result": "INCONCLUSIVE",
                 "reason": "; ".join(self.reader_errors),
                 "kill_delay_ms": kill_delay_ms,
                 "active_at_kill": active_at_kill,
@@ -550,12 +752,11 @@ class IterationRunner:
         actual_state = read_recovered_dump(self.database_path)
         with self.status_lock:
             statuses = dict(self.statuses)
-        result, candidates, explanation = verify_oracle(
-            self.attempts,
-            statuses,
+        result, candidates, explanation = verify_oracle_log(
+            self.oracle.path,
             actual_state,
         )
-        if self.writer_errors and result != "FAIL":
+        if self.writer_errors:
             result = "INCONCLUSIVE"
             explanation = "writer pipe outcome uncertain: {}".format(
                 "; ".join(self.writer_errors)
@@ -612,7 +813,12 @@ class IterationRunner:
                     if writer.is_alive():
                         raise HarnessError("Writer thread did not stop during cleanup")
                 if self.process.stdin and not self.process.stdin.closed:
-                    self.process.stdin.close()
+                    try:
+                        self.process.stdin.close()
+                    except OSError as error:
+                        self.writer_errors.append(
+                            "closing SERVE stdin during cleanup: {}".format(error)
+                        )
                 for thread_name in ("stdout_thread", "stderr_thread"):
                     thread = getattr(self, thread_name, None)
                     if thread is not None:
