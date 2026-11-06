@@ -1,5 +1,7 @@
 import argparse
 import base64
+import binascii
+import json
 import os
 import sys
 import time
@@ -10,6 +12,8 @@ if not __package__:
 
 
 MAX_BATCH_OPERATIONS = 10000
+MAX_KEY_LENGTH = 1024
+MAX_VALUE_LENGTH = 1024 * 1024
 
 
 def default_database_path():
@@ -96,6 +100,213 @@ def read_batch_operations(batch_file):
     return operations
 
 
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON field: {}".format(key))
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value):
+    raise ValueError("Invalid JSON constant: {}".format(value))
+
+
+def _valid_operation_id(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value != "-"
+        and value.isascii()
+        and all(character.isprintable() and not character.isspace() for character in value)
+    )
+
+
+def _decode_request_bytes(value, field_name, maximum_length):
+    if not isinstance(value, str):
+        raise ValueError("{} must be a Base64 string".format(field_name))
+
+    if maximum_length is not None:
+        maximum_encoded_length = 4 * ((maximum_length + 2) // 3)
+        if len(value) > maximum_encoded_length:
+            raise ValueError("{} exceeds the maximum length".format(field_name))
+
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+        raise ValueError("{} must contain valid Base64".format(field_name)) from error
+
+    if base64.b64encode(decoded).decode("ascii") != value:
+        raise ValueError("{} must contain canonical Base64".format(field_name))
+
+    if maximum_length is not None and len(decoded) > maximum_length:
+        raise ValueError("{} exceeds the maximum length".format(field_name))
+    return decoded
+
+
+def _validate_request_fields(request, required_fields):
+    missing = required_fields - request.keys()
+    if missing:
+        raise ValueError("Missing request field: {}".format(sorted(missing)[0]))
+
+    extra = request.keys() - required_fields
+    if extra:
+        raise ValueError("Unexpected request field: {}".format(sorted(extra)[0]))
+
+
+def _load_serve_json(line):
+    return json.loads(
+        line,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _parse_serve_request(request):
+    if not isinstance(request, dict):
+        raise ValueError("Request must be a JSON object")
+
+    operation_id = request.get("id")
+    if not _valid_operation_id(operation_id):
+        raise ValueError("Invalid operation id")
+
+    operation = request.get("op")
+    if operation == "put":
+        _validate_request_fields(request, {"id", "op", "key", "value"})
+        key = _decode_request_bytes(request["key"], "key", MAX_KEY_LENGTH)
+        value = _decode_request_bytes(
+            request["value"], "value", MAX_VALUE_LENGTH
+        )
+        if not key:
+            raise ValueError("key must be at least 1 byte")
+        return operation_id, ("put", key, value)
+
+    if operation == "delete":
+        _validate_request_fields(request, {"id", "op", "key"})
+        key = _decode_request_bytes(request["key"], "key", MAX_KEY_LENGTH)
+        if not key:
+            raise ValueError("key must be at least 1 byte")
+        return operation_id, ("delete", key)
+
+    if operation == "batch":
+        _validate_request_fields(request, {"id", "op", "operations"})
+        request_operations = request["operations"]
+        if not isinstance(request_operations, list):
+            raise ValueError("operations must be a JSON array")
+        if not 1 <= len(request_operations) <= MAX_BATCH_OPERATIONS:
+            raise ValueError(
+                "batch must contain between 1 and {} operations".format(
+                    MAX_BATCH_OPERATIONS
+                )
+            )
+
+        operations = []
+        for index, batch_operation in enumerate(request_operations):
+            if not isinstance(batch_operation, dict):
+                raise ValueError(
+                    "batch operation {} must be a JSON object".format(index)
+                )
+
+            operation_type = batch_operation.get("op")
+            if operation_type == "put":
+                _validate_request_fields(
+                    batch_operation, {"op", "key", "value"}
+                )
+                key = _decode_request_bytes(
+                    batch_operation["key"], "key", MAX_KEY_LENGTH
+                )
+                value = _decode_request_bytes(
+                    batch_operation["value"], "value", MAX_VALUE_LENGTH
+                )
+                if not key:
+                    raise ValueError("batch key must be at least 1 byte")
+                operations.append(("put", key, value))
+            elif operation_type == "delete":
+                _validate_request_fields(batch_operation, {"op", "key"})
+                key = _decode_request_bytes(
+                    batch_operation["key"], "key", MAX_KEY_LENGTH
+                )
+                if not key:
+                    raise ValueError("batch key must be at least 1 byte")
+                operations.append(("delete", key))
+            else:
+                raise ValueError(
+                    "Unsupported batch operation at index {}".format(index)
+                )
+        return operation_id, ("batch", operations)
+
+    raise ValueError("Unsupported operation")
+
+
+def _clean_error_reason(error):
+    return " ".join(str(error).split()) or type(error).__name__
+
+
+def serve(database_path, input_stream=None, output_stream=None, error_stream=None):
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stdout if output_stream is None else output_stream
+    error_stream = sys.stderr if error_stream is None else error_stream
+
+    if __package__:
+        from .database import Database
+    else:
+        from src.database import Database
+
+    try:
+        db = Database(database_path)
+    except Exception as error:
+        print("Error opening database: {}".format(_clean_error_reason(error)),
+              file=error_stream, flush=True)
+        return 1
+
+    exit_code = 0
+    try:
+        for line in input_stream:
+            operation_id = "-"
+            try:
+                request = _load_serve_json(line)
+                if isinstance(request, dict) and _valid_operation_id(
+                    request.get("id")
+                ):
+                    operation_id = request["id"]
+                operation_id, operation = _parse_serve_request(request)
+                operation_type = operation[0]
+
+                if operation_type == "put":
+                    _, key, value = operation
+                    db.put(key, value)
+                elif operation_type == "delete":
+                    _, key = operation
+                    db.delete(key)
+                else:
+                    _, operations = operation
+                    if db.batch(operations) is not True:
+                        raise RuntimeError("batch did not confirm success")
+
+                response = "ACK {}".format(operation_id)
+            except Exception as error:
+                response = "ERR {} {}".format(
+                    operation_id, _clean_error_reason(error)
+                )
+
+            output_stream.write(response + "\n")
+            output_stream.flush()
+    except Exception as error:
+        print("Error reading SERVE input: {}".format(_clean_error_reason(error)),
+              file=error_stream, flush=True)
+        exit_code = 1
+    finally:
+        try:
+            db.close()
+        except Exception as error:
+            print("Error closing database: {}".format(_clean_error_reason(error)),
+                  file=error_stream, flush=True)
+            exit_code = 1
+
+    return exit_code
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Simple key-value database")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -138,6 +349,13 @@ def main(argv=None):
                               help="legacy database file path")
     check_parser.add_argument("--db", help="database file path")
 
+    serve_parser = commands.add_parser(
+        "serve", help="serve newline-delimited JSON requests"
+    )
+    serve_parser.add_argument("operands", nargs="?", metavar="PATH",
+                              help="database file path")
+    serve_parser.add_argument("--db", help="database file path")
+
     args = parser.parse_args(argv)
 
     try:
@@ -149,8 +367,12 @@ def main(argv=None):
             "open": 0,
             "dump": 0,
             "check": 0,
+            "serve": 0,
         }[args.command]
         path, operands = resolve_database_arguments(args, argument_count)
+
+        if args.command == "serve":
+            return serve(path)
 
         operations = None
         if args.command == "batch":
