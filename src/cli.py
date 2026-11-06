@@ -5,11 +5,8 @@ import sys
 import time
 from pathlib import Path
 
-if __package__:
-    from .database import Database
-else:
+if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from src.database import Database
 
 
 MAX_BATCH_OPERATIONS = 10000
@@ -38,15 +35,17 @@ def default_database_path():
 
 def resolve_database_arguments(args, required_count):
     operands = args.operands or []
-
-    if len(operands) == required_count:
-        return args.db or default_database_path(), operands
+    if isinstance(operands, str):
+        operands = [operands]
 
     if len(operands) == required_count + 1 and args.db is None:
         return operands[0], operands[1:]
 
     if args.db is not None and len(operands) == required_count + 1:
         raise ValueError("Specify the database path either positionally or with --db, not both")
+
+    if len(operands) == required_count:
+        return args.db or default_database_path(), operands
 
     raise ValueError(
         "Expected {} command argument{}".format(
@@ -81,7 +80,7 @@ def read_batch_operations(batch_file):
                     raise ValueError(
                         "Malformed DEL operation on line {}".format(line_number)
                     )
-                operations.append(("delete", parts[1].encode("utf-8")))
+                operations.append(("delete", parts[1].encode("utf-8"), None))
             else:
                 raise ValueError(
                     "Invalid operation on line {}: {}".format(line_number, operation)
@@ -157,12 +156,24 @@ def main(argv=None):
         if args.command == "batch":
             operations = read_batch_operations(operands[0])
 
+        if __package__:
+            from .database import Database
+        else:
+            from src.database import Database
+
         open_started = time.perf_counter() if args.command == "open" else None
         db = Database(path)
 
         if args.command == "open":
             open_elapsed_ms = (time.perf_counter() - open_started) * 1000
-            print("Live keys: {}".format(len(db.index)))
+            key_count = getattr(db, "key_count", None)
+            if not callable(key_count):
+                raise ValueError(
+                    "Database.key_count() is not available; "
+                    "the storage engine must implement it"
+                )
+            live_keys = key_count()
+            print("Live keys: {}".format(live_keys))
             print(
                 "Open/recovery time (includes initialization): "
                 "{:.3f} ms".format(open_elapsed_ms)
@@ -170,19 +181,38 @@ def main(argv=None):
             return 0
 
         if args.command == "dump":
-            for key, value in sorted(db.index.items()):
+            items_method = getattr(db, "items", None)
+            if not callable(items_method):
+                raise ValueError(
+                    "Database.items() is not available; "
+                    "the storage engine must implement it"
+                )
+            for key, value in sorted(items_method(), key=lambda item: item[0]):
                 encoded_key = base64.b64encode(key).decode("ascii")
                 encoded_value = base64.b64encode(value).decode("ascii")
                 print("key={} value={}".format(encoded_key, encoded_value))
             return 0
 
         if args.command == "check":
-            # Opening the database recovers and validates its records.
+            check_method = getattr(db, "check", None)
+            if not callable(check_method):
+                raise ValueError(
+                    "Database.check() is not available; "
+                    "the storage engine must implement it"
+                )
+            if check_method() is not True:
+                raise ValueError("Database.check() did not confirm integrity")
             print("OK: database integrity verified")
             return 0
 
         if args.command == "batch":
-            db.batch(operations)
+            batch_method = getattr(db, "batch", None)
+            if not callable(batch_method):
+                raise ValueError(
+                    "Database.batch() is not available; "
+                    "the storage engine must implement it"
+                )
+            batch_method(operations)
             print("OK")
             return 0
 
