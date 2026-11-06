@@ -1,6 +1,8 @@
 import contextlib
 import io
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -14,6 +16,8 @@ class FakeDatabase:
     put_error = None
     delete_error = None
     deleted_keys = []
+    batch_error = None
+    batch_calls = []
 
     def __init__(self, path):
         self.path = path
@@ -33,6 +37,11 @@ class FakeDatabase:
         FakeDatabase.deleted_keys.append(key)
         FakeDatabase.values.pop(key, None)
 
+    def batch(self, operations):
+        FakeDatabase.batch_calls.append(operations)
+        if FakeDatabase.batch_error is not None:
+            raise FakeDatabase.batch_error
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
@@ -41,11 +50,20 @@ class CliTests(unittest.TestCase):
         FakeDatabase.put_error = None
         FakeDatabase.delete_error = None
         FakeDatabase.deleted_keys = []
+        FakeDatabase.batch_error = None
+        FakeDatabase.batch_calls = []
         database_module = types.ModuleType("src.database")
         database_module.Database = FakeDatabase
         self.module_patch = patch.dict(sys.modules, {"src.database": database_module})
         self.module_patch.start()
         self.addCleanup(self.module_patch.stop)
+
+    def write_batch_file(self, contents):
+        file_descriptor, path = tempfile.mkstemp()
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
+            file.write(contents)
+        self.addCleanup(os.remove, path)
+        return path
 
     def run_cli(self, arguments):
         stdout = io.StringIO()
@@ -131,6 +149,118 @@ class CliTests(unittest.TestCase):
         self.assertEqual(FakeDatabase.values, {
             "café".encode("utf-8"): "こんにちは".encode("utf-8")
         })
+
+    def test_batch_calls_database_once_with_encoded_operations(self):
+        batch_file = self.write_batch_file(
+            "PUT name Rahul\nPUT age 20\nDEL old\n"
+        )
+
+        exit_code, stdout, stderr = self.run_cli(
+            ["batch", "test.kv", batch_file]
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, "OK\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(len(FakeDatabase.batch_calls), 1)
+        self.assertEqual(
+            FakeDatabase.batch_calls[0],
+            [
+                ("put", b"name", b"Rahul"),
+                ("put", b"age", b"20"),
+                ("delete", b"old", None),
+            ],
+        )
+
+    def test_batch_preserves_spaces_in_put_value(self):
+        batch_file = self.write_batch_file("PUT greeting hello from the CLI\n")
+
+        exit_code, stdout, stderr = self.run_cli(
+            ["batch", "test.kv", batch_file]
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, "OK\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            FakeDatabase.batch_calls,
+            [[("put", b"greeting", b"hello from the CLI")]],
+        )
+
+    def test_batch_rejects_invalid_operation_without_calling_database(self):
+        batch_file = self.write_batch_file("SET name Rahul\n")
+
+        exit_code, stdout, stderr = self.run_cli(
+            ["batch", "test.kv", batch_file]
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Invalid operation", stderr)
+        self.assertEqual(FakeDatabase.batch_calls, [])
+
+    def test_malformed_batch_does_not_call_database(self):
+        batch_file = self.write_batch_file("PUT name\nDEL old extra\n")
+
+        exit_code, stdout, stderr = self.run_cli(
+            ["batch", "test.kv", batch_file]
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Malformed PUT", stderr)
+        self.assertEqual(FakeDatabase.batch_calls, [])
+
+    def test_missing_batch_file_returns_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing_path = os.path.join(directory, "missing.txt")
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["batch", "test.kv", missing_path]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Error:", stderr)
+        self.assertEqual(FakeDatabase.batch_calls, [])
+
+    def test_batch_database_failure_does_not_print_success(self):
+        FakeDatabase.batch_error = ValueError("batch failed")
+        batch_file = self.write_batch_file("PUT name Rahul\n")
+
+        exit_code, stdout, stderr = self.run_cli(
+            ["batch", "test.kv", batch_file]
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("batch failed", stderr)
+        self.assertEqual(len(FakeDatabase.batch_calls), 1)
+
+    def test_batch_rejects_more_than_10000_operations(self):
+        batch_file = self.write_batch_file("DEL key\n" * 10001)
+
+        exit_code, stdout, stderr = self.run_cli(
+            ["batch", "test.kv", batch_file]
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("cannot exceed 10000", stderr)
+        self.assertEqual(FakeDatabase.batch_calls, [])
+
+    def test_batch_reports_missing_database_batch_method(self):
+        batch_file = self.write_batch_file("PUT name Rahul\n")
+
+        with patch.object(FakeDatabase, "batch", None):
+            exit_code, stdout, stderr = self.run_cli(
+                ["batch", "test.kv", batch_file]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Database.batch() is not available", stderr)
+        self.assertEqual(FakeDatabase.batch_calls, [])
 
 
 if __name__ == "__main__":
