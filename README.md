@@ -49,3 +49,25 @@ The database engine writes records through `append_record()`, which calls
 therefore acknowledges only after those methods return. This describes the
 current implementation and is not, by itself, a claim of crash-safety across
 every filesystem or hardware failure mode.
+
+## V1 torture harness
+
+Run the basic seeded crash test from the repository root:
+
+```powershell
+python torture.py --iterations 5 --seed 12345
+```
+
+`--iterations` defaults to 500; `--seed` is required. The basic mode starts a
+SERVE subprocess per iteration, sends concurrent random PUT, DELETE, and BATCH
+requests, force-kills the process, then checks the recovered database with
+separate `open`, `check`, and `dump` CLI subprocesses. `--workdir PATH` retains
+artifacts in a newly created unique run directory under PATH; without it, a
+temporary directory is used. Request generation and kill delays are seeded,
+but OS scheduling means crash timing is not deterministic.
+
+The verifier requires all ACKed writes and allows the single next in-flight
+request to have committed or not. It reports INCONCLUSIVE rather than assuming
+an outcome when response/history evidence cannot establish a safe serialized
+order. `large-value`, `max-batch`, `recovery-crash`, `compaction-crash`, and
+`disk-full` modes are currently NOT IMPLEMENTED.
