@@ -1,0 +1,3 @@
+PUT name Anu
+PUT city Mysuru
+DEL old-key

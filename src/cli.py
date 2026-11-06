@@ -1,10 +1,58 @@
 import argparse
 import base64
+import os
 import sys
 import time
+from pathlib import Path
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 MAX_BATCH_OPERATIONS = 10000
+
+
+def default_database_path():
+    if os.name == "nt":
+        data_directory = Path(
+            os.environ.get(
+                "LOCALAPPDATA",
+                Path.home() / "AppData" / "Local",
+            )
+        )
+    else:
+        data_directory = Path(
+            os.environ.get(
+                "XDG_DATA_HOME",
+                Path.home() / ".local" / "share",
+            )
+        )
+
+    directory = data_directory / "Aid_Map"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "aid_map.kv"
+
+
+def resolve_database_arguments(args, required_count):
+    operands = args.operands or []
+    if isinstance(operands, str):
+        operands = [operands]
+
+    if len(operands) == required_count + 1 and args.db is None:
+        return operands[0], operands[1:]
+
+    if args.db is not None and len(operands) == required_count + 1:
+        raise ValueError("Specify the database path either positionally or with --db, not both")
+
+    if len(operands) == required_count:
+        return args.db or default_database_path(), operands
+
+    raise ValueError(
+        "Expected {} command argument{}".format(
+            required_count,
+            "" if required_count == 1 else "s",
+        )
+    )
 
 
 def read_batch_operations(batch_file):
@@ -53,55 +101,79 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
 
     put_parser = commands.add_parser("put", help="store a value")
-    put_parser.add_argument("path", help="database file path")
-    put_parser.add_argument("key", help="key to store")
-    put_parser.add_argument("value", help="value to store")
+    put_parser.add_argument("operands", nargs="+", metavar="ARG",
+                            help="KEY VALUE (or legacy PATH KEY VALUE)")
+    put_parser.add_argument("--db", help="database file path")
 
     get_parser = commands.add_parser("get", help="retrieve a value")
-    get_parser.add_argument("path", help="database file path")
-    get_parser.add_argument("key", help="key to retrieve")
+    get_parser.add_argument("operands", nargs="+", metavar="ARG",
+                            help="KEY (or legacy PATH KEY)")
+    get_parser.add_argument("--db", help="database file path")
 
     delete_parser = commands.add_parser("del", help="delete a value")
-    delete_parser.add_argument("path", help="database file path")
-    delete_parser.add_argument("key", help="key to delete")
+    delete_parser.add_argument("operands", nargs="+", metavar="ARG",
+                               help="KEY (or legacy PATH KEY)")
+    delete_parser.add_argument("--db", help="database file path")
 
     batch_parser = commands.add_parser("batch", help="run a batch of operations")
-    batch_parser.add_argument("path", help="database file path")
-    batch_parser.add_argument("batch_file", help="UTF-8 batch input file")
+    batch_parser.add_argument("operands", nargs="+", metavar="ARG",
+                              help="BATCH_FILE (or legacy PATH BATCH_FILE)")
+    batch_parser.add_argument("--db", help="database file path")
 
     open_parser = commands.add_parser("open", help="open a database and report stats")
-    open_parser.add_argument("path", help="database file path")
+    open_parser.add_argument("operands", nargs="?", metavar="PATH",
+                             help="legacy database file path")
+    open_parser.add_argument("--db", help="database file path")
 
     dump_parser = commands.add_parser(
         "dump",
         help="dump live entries as Base64 key=<...> value=<...> lines",
     )
-    dump_parser.add_argument("path", help="database file path")
+    dump_parser.add_argument("operands", nargs="?", metavar="PATH",
+                             help="legacy database file path")
+    dump_parser.add_argument("--db", help="database file path")
 
     check_parser = commands.add_parser("check", help="verify database integrity")
-    check_parser.add_argument("path", help="database file path")
+    check_parser.add_argument("operands", nargs="?", metavar="PATH",
+                              help="legacy database file path")
+    check_parser.add_argument("--db", help="database file path")
 
     args = parser.parse_args(argv)
 
     try:
+        argument_count = {
+            "put": 2,
+            "get": 1,
+            "del": 1,
+            "batch": 1,
+            "open": 0,
+            "dump": 0,
+            "check": 0,
+        }[args.command]
+        path, operands = resolve_database_arguments(args, argument_count)
+
         operations = None
         if args.command == "batch":
-            operations = read_batch_operations(args.batch_file)
+            operations = read_batch_operations(operands[0])
 
-        from src.database import Database
+        if __package__:
+            from .database import Database
+        else:
+            from src.database import Database
 
         open_started = time.perf_counter() if args.command == "open" else None
-        db = Database(args.path)
+        db = Database(path)
 
         if args.command == "open":
             open_elapsed_ms = (time.perf_counter() - open_started) * 1000
-            key_count_method = getattr(db, "key_count", None)
-            if not callable(key_count_method):
+            key_count = getattr(db, "key_count", None)
+            if not callable(key_count):
                 raise ValueError(
                     "Database.key_count() is not available; "
                     "the storage engine must implement it"
                 )
-            print("Live keys: {}".format(key_count_method()))
+            live_keys = key_count()
+            print("Live keys: {}".format(live_keys))
             print(
                 "Open/recovery time (includes initialization): "
                 "{:.3f} ms".format(open_elapsed_ms)
@@ -136,20 +208,18 @@ def main(argv=None):
         if args.command == "batch":
             batch_method = getattr(db, "batch", None)
             if not callable(batch_method):
-                print(
-                    "Error: Database.batch() is not available; "
-                    "the storage engine must implement it",
-                    file=sys.stderr,
+                raise ValueError(
+                    "Database.batch() is not available; "
+                    "the storage engine must implement it"
                 )
-                return 1
             batch_method(operations)
             print("OK")
             return 0
 
-        key = args.key.encode("utf-8")
+        key = operands[0].encode("utf-8")
 
         if args.command == "put":
-            db.put(key, args.value.encode("utf-8"))
+            db.put(key, operands[1].encode("utf-8"))
             print("OK")
         elif args.command == "get":
             value = db.get(key)
