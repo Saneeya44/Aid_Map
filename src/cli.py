@@ -1,5 +1,7 @@
 import argparse
+import base64
 import sys
+import time
 
 
 MAX_BATCH_OPERATIONS = 10000
@@ -67,6 +69,18 @@ def main(argv=None):
     batch_parser.add_argument("path", help="database file path")
     batch_parser.add_argument("batch_file", help="UTF-8 batch input file")
 
+    open_parser = commands.add_parser("open", help="open a database and report stats")
+    open_parser.add_argument("path", help="database file path")
+
+    dump_parser = commands.add_parser(
+        "dump",
+        help="dump live entries as Base64 key=<...> value=<...> lines",
+    )
+    dump_parser.add_argument("path", help="database file path")
+
+    check_parser = commands.add_parser("check", help="verify database integrity")
+    check_parser.add_argument("path", help="database file path")
+
     args = parser.parse_args(argv)
 
     try:
@@ -76,7 +90,48 @@ def main(argv=None):
 
         from src.database import Database
 
+        open_started = time.perf_counter() if args.command == "open" else None
         db = Database(args.path)
+
+        if args.command == "open":
+            open_elapsed_ms = (time.perf_counter() - open_started) * 1000
+            key_count_method = getattr(db, "key_count", None)
+            if not callable(key_count_method):
+                raise ValueError(
+                    "Database.key_count() is not available; "
+                    "the storage engine must implement it"
+                )
+            print("Live keys: {}".format(key_count_method()))
+            print(
+                "Open/recovery time (includes initialization): "
+                "{:.3f} ms".format(open_elapsed_ms)
+            )
+            return 0
+
+        if args.command == "dump":
+            items_method = getattr(db, "items", None)
+            if not callable(items_method):
+                raise ValueError(
+                    "Database.items() is not available; "
+                    "the storage engine must implement it"
+                )
+            for key, value in sorted(items_method(), key=lambda item: item[0]):
+                encoded_key = base64.b64encode(key).decode("ascii")
+                encoded_value = base64.b64encode(value).decode("ascii")
+                print("key={} value={}".format(encoded_key, encoded_value))
+            return 0
+
+        if args.command == "check":
+            check_method = getattr(db, "check", None)
+            if not callable(check_method):
+                raise ValueError(
+                    "Database.check() is not available; "
+                    "the storage engine must implement it"
+                )
+            if check_method() is not True:
+                raise ValueError("Database.check() did not confirm integrity")
+            print("OK: database integrity verified")
+            return 0
 
         if args.command == "batch":
             batch_method = getattr(db, "batch", None)
@@ -105,7 +160,7 @@ def main(argv=None):
         else:
             db.delete(key)
             print("OK")
-    except (ImportError, OSError, TypeError, ValueError) as error:
+    except (ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
         print("Error: {}".format(error), file=sys.stderr)
         return 1
 
