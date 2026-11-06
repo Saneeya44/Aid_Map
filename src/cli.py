@@ -356,6 +356,13 @@ def main(argv=None):
                               help="database file path")
     serve_parser.add_argument("--db", help="database file path")
 
+    compact_parser = commands.add_parser(
+        "compact", help="reclaim space used by obsolete records"
+    )
+    compact_parser.add_argument("operands", nargs="?", metavar="PATH",
+                                help="legacy database file path")
+    compact_parser.add_argument("--db", help="database file path")
+
     args = parser.parse_args(argv)
 
     try:
@@ -368,6 +375,7 @@ def main(argv=None):
             "dump": 0,
             "check": 0,
             "serve": 0,
+            "compact": 0,
         }[args.command]
         path, operands = resolve_database_arguments(args, argument_count)
 
@@ -425,6 +433,15 @@ def main(argv=None):
                 encoded_key = base64.b64encode(key).decode("ascii")
                 encoded_value = base64.b64encode(value).decode("ascii")
                 print("key={} value={}".format(encoded_key, encoded_value))
+            return 0
+
+        if args.command == "compact":
+            before_bytes, after_bytes = db.compact()
+            print(
+                "Compacted database: {} -> {} bytes".format(
+                    before_bytes, after_bytes
+                )
+            )
             return 0
 
         if args.command == "batch":

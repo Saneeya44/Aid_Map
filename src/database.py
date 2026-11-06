@@ -3,7 +3,12 @@ import os
 import struct
 import threading
 
-from .storage import append_record, read_records, verify_records
+from .storage import (
+    append_record,
+    read_records,
+    replace_records_atomically,
+    verify_records,
+)
 from .locking import FileLock
 
 
@@ -455,6 +460,20 @@ class Database:
                 self._apply_operations(decoded)
 
                 return True
+
+    def compact(self):
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                before_bytes = os.path.getsize(self.path)
+                records = [
+                    (PUT, self._encode_put(key, value))
+                    for key, value in sorted(self.index.items())
+                ]
+                replace_records_atomically(self.path, records)
+                return before_bytes, os.path.getsize(self.path)
 
     # --------------------------------
     # CLOSE

@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-SUPPORTED_MODES = ("basic",)
+SUPPORTED_MODES = ("basic", "compaction-crash", "disk-full")
 KNOWN_MODES = (
     "basic",
     "large-value",
@@ -335,6 +335,15 @@ class IterationRunner:
         self.writers = []
         self.closed = False
 
+    def _close_process_stream(self, stream):
+        if stream is None or stream.closed:
+            return
+        try:
+            stream.close()
+        except OSError:
+            if self.process.poll() is None:
+                raise
+
     def _record_response(self, line):
         try:
             response_type, operation_id, reason = parse_response(line)
@@ -446,9 +455,6 @@ class IterationRunner:
                             "id": request["id"],
                             "reason": str(error),
                         })
-                        self.writer_errors.append(
-                            "send {}: {}".format(request["id"], error)
-                        )
                         self.stop_event.set()
                         break
 
@@ -481,8 +487,7 @@ class IterationRunner:
             self.process.wait(timeout=PROCESS_TIMEOUT)
         except subprocess.TimeoutExpired as error:
             raise HarnessError("Could not reap killed SERVE process") from error
-        if self.process.stdin and not self.process.stdin.closed:
-            self.process.stdin.close()
+        self._close_process_stream(self.process.stdin)
         self.stdout_thread.join(timeout=READER_TIMEOUT)
         self.stderr_thread.join(timeout=READER_TIMEOUT)
         if self.stdout_thread.is_alive() or self.stderr_thread.is_alive():
@@ -611,8 +616,6 @@ class IterationRunner:
                     writer.join(timeout=READER_TIMEOUT)
                     if writer.is_alive():
                         raise HarnessError("Writer thread did not stop during cleanup")
-                if self.process.stdin and not self.process.stdin.closed:
-                    self.process.stdin.close()
                 for thread_name in ("stdout_thread", "stderr_thread"):
                     thread = getattr(self, thread_name, None)
                     if thread is not None:
@@ -621,10 +624,9 @@ class IterationRunner:
                             raise HarnessError(
                                 "Output reader did not stop during cleanup"
                             )
-                for stream_name in ("stdout", "stderr"):
+                for stream_name in ("stdin", "stdout", "stderr"):
                     stream = getattr(self.process, stream_name, None)
-                    if stream is not None and not stream.closed:
-                        stream.close()
+                    self._close_process_stream(stream)
         finally:
             self.oracle.close()
             self.closed = True
@@ -749,6 +751,296 @@ def run_basic(iterations, seed, workdir=None):
             temporary.cleanup()
 
 
+def _scenario_root(workdir):
+    if workdir is None:
+        temporary = tempfile.TemporaryDirectory(prefix="aid-map-torture-")
+        return temporary, temporary.name
+    parent = os.path.abspath(workdir)
+    os.makedirs(parent, exist_ok=True)
+    return None, tempfile.mkdtemp(prefix="aid-map-torture-", dir=parent)
+
+
+def _run_python(code, *arguments, input_text=None):
+    try:
+        result = subprocess.run(
+            [sys.executable, "-u", "-c", code, *map(str, arguments)],
+            cwd=str(ROOT),
+            env=_environment(),
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise HarnessError("Injected scenario process timed out") from error
+    if result.returncode != 0:
+        raise HarnessError(
+            "Injected scenario process failed: {}".format(
+                (result.stderr or result.stdout).strip()
+            )
+        )
+    return result
+
+
+def _prepare_compaction_database(database_path, generator):
+    values = {}
+    with open(database_path, "wb"):
+        pass
+    from src.database import Database
+
+    with Database(database_path) as database:
+        for index in range(24):
+            key = "key-{:02d}".format(index).encode("ascii")
+            for version in range(generator.randint(3, 7)):
+                value = random_value(generator)
+                database.put(key, value)
+            if index % 3 == 0:
+                database.delete(key)
+            else:
+                values[key] = value
+    return values
+
+
+def _kill_compaction_at_replace(database_path, phase):
+    code = r"""
+import sys
+import src.storage as storage
+from src.database import Database
+
+original_replace = storage.os.replace
+original_encode_record = storage.encode_record
+phase = sys.argv[2]
+
+def pause():
+    print("READY", flush=True)
+    sys.stdin.readline()
+
+def pause_during_write(record_type, payload):
+    record = original_encode_record(record_type, payload)
+    pause()
+    return record
+
+def pause_at_replace(source, destination):
+    if phase == "after":
+        original_replace(source, destination)
+    pause()
+    if phase == "before":
+        original_replace(source, destination)
+    raise SystemExit(17)
+
+if phase == "write":
+    storage.encode_record = pause_during_write
+else:
+    storage.os.replace = pause_at_replace
+with Database(sys.argv[1]) as database:
+    database.compact()
+"""
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                code,
+                str(database_path),
+                phase,
+            ],
+            cwd=str(ROOT),
+            env=_environment(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        ready = process.stdout.readline()
+        if ready != "READY\n":
+            stderr = process.stderr.read()
+            raise HarnessError(
+                "Compaction did not reach replacement boundary: {}".format(
+                    stderr.strip()
+                )
+            )
+        process.kill()
+        process.wait(timeout=PROCESS_TIMEOUT)
+        if process.stdin:
+            process.stdin.close()
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
+    except BaseException:
+        if "process" in locals() and process.poll() is None:
+            process.kill()
+            process.wait(timeout=PROCESS_TIMEOUT)
+        raise
+
+
+def _run_compaction_crash(iterations, seed, workdir):
+    generator = random.Random(seed)
+    temporary, run_root = _scenario_root(workdir)
+    passed = failed = 0
+    try:
+        for iteration in range(1, iterations + 1):
+            iteration_directory = os.path.join(
+                run_root, "iteration-{:06d}".format(iteration)
+            )
+            os.mkdir(iteration_directory)
+            database_path = os.path.join(iteration_directory, "database.kv")
+            expected = _prepare_compaction_database(database_path, generator)
+            original_size = os.path.getsize(database_path)
+            phase = generator.choice(("write", "before", "after"))
+
+            try:
+                _kill_compaction_at_replace(database_path, phase)
+                actual = read_recovered_dump(database_path)
+                if actual != expected:
+                    raise HarnessError("recovered state differs from live-key oracle")
+                compacted_size = os.path.getsize(database_path)
+                if phase == "after" and compacted_size >= original_size:
+                    raise HarnessError("compaction did not reclaim database space")
+                if phase != "after" and compacted_size != original_size:
+                    raise HarnessError("pre-replacement kill changed the original log")
+                passed += 1
+                result = "PASS"
+                reason = "recovered all live keys after {}".format({
+                    "write": "interrupted snapshot write",
+                    "before": "pre-replacement kill",
+                    "after": "replacement",
+                }[phase])
+            except Exception as error:
+                failed += 1
+                result = "FAIL"
+                reason = str(error)
+            print(
+                "ITER {}/{} {} phase={} {}".format(
+                    iteration,
+                    iterations,
+                    result,
+                    {
+                        "write": "during-snapshot-write",
+                        "before": "before-replace",
+                        "after": "after-replace",
+                    }[phase],
+                    reason,
+                ),
+                flush=True,
+            )
+            if result == "FAIL":
+                print("FIRST FAILURE seed={} iteration={}".format(seed, iteration))
+                break
+
+        print(
+            "SUMMARY PASS={} FAIL=0 seed={} iterations={}".format(
+                passed, seed, iterations
+            ) if failed == 0 else
+            "SUMMARY PASS={} FAIL={} seed={} iterations={}".format(
+                passed, failed, seed, iteration
+            ),
+            flush=True,
+        )
+        if temporary is None:
+            print("Artifacts: {}".format(run_root), flush=True)
+        return 1 if failed else 0
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+
+
+def _run_disk_full(iterations, seed, workdir):
+    generator = random.Random(seed)
+    temporary, run_root = _scenario_root(workdir)
+    passed = failed = 0
+    code = r"""
+import errno
+import sys
+import src.storage as storage
+from src.cli import main
+
+original_write = storage.os.write
+failed = False
+
+def partial_then_enospc(fd, data):
+    global failed
+    if not failed:
+        failed = True
+        data = bytes(data)
+        original_write(fd, data[:max(1, len(data) // 2)])
+        raise OSError(errno.ENOSPC, "simulated disk full")
+    return original_write(fd, data)
+
+storage.os.write = partial_then_enospc
+raise SystemExit(main(["serve", sys.argv[1]]))
+"""
+    try:
+        for iteration in range(1, iterations + 1):
+            iteration_directory = os.path.join(
+                run_root, "iteration-{:06d}".format(iteration)
+            )
+            os.mkdir(iteration_directory)
+            database_path = os.path.join(iteration_directory, "database.kv")
+            from src.database import Database
+
+            key = ("committed-{}".format(generator.getrandbits(32))).encode("ascii")
+            value = random_value(generator)
+            with Database(database_path) as database:
+                database.put(key, value)
+
+            request_id = "disk-full-{}".format(iteration)
+            request = {
+                "id": request_id,
+                "op": "put",
+                "key": _b64(b"uncommitted"),
+                "value": _b64(b"new-value"),
+            }
+            try:
+                result = _run_python(
+                    code,
+                    database_path,
+                    input_text=json.dumps(request) + "\n",
+                )
+                expected_error = "ERR {} [Errno 28] simulated disk full\n".format(
+                    request_id
+                )
+                if result.stdout != expected_error:
+                    raise HarnessError(
+                        "expected ERR without ACK, got {!r}".format(result.stdout)
+                    )
+                actual = read_recovered_dump(database_path)
+                if actual != {key: value}:
+                    raise HarnessError("partial failed write changed committed state")
+                passed += 1
+                reason = "partial ENOSPC produced ERR and preserved old state"
+                result_label = "PASS"
+            except Exception as error:
+                failed += 1
+                reason = str(error)
+                result_label = "FAIL"
+            print(
+                "ITER {}/{} {} {}".format(
+                    iteration, iterations, result_label, reason
+                ),
+                flush=True,
+            )
+            if failed:
+                print("FIRST FAILURE seed={} iteration={}".format(seed, iteration))
+                break
+
+        print(
+            "SUMMARY PASS={} FAIL={} seed={} iterations={}".format(
+                passed, failed, seed, iteration if iterations else 0
+            ),
+            flush=True,
+        )
+        if temporary is None:
+            print("Artifacts: {}".format(run_root), flush=True)
+        return 1 if failed else 0
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.mode not in SUPPORTED_MODES:
@@ -758,7 +1050,11 @@ def main(argv=None):
             "iterations={}".format(args.seed, args.iterations)
         )
         return 2
-    return run_basic(args.iterations, args.seed, args.workdir)
+    if args.mode == "basic":
+        return run_basic(args.iterations, args.seed, args.workdir)
+    if args.mode == "compaction-crash":
+        return _run_compaction_crash(args.iterations, args.seed, args.workdir)
+    return _run_disk_full(args.iterations, args.seed, args.workdir)
 
 
 if __name__ == "__main__":
