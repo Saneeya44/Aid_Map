@@ -141,9 +141,16 @@ class Database:
                 payload += struct.pack(">I", len(value))
                 payload += value
 
-            elif len(operation) == 2 and operation[0] == "delete":
+            elif (
+                len(operation) == 2
+                and operation[0] == "delete"
+            ) or (
+                len(operation) == 3
+                and operation[0] == "delete"
+                and operation[2] is None
+            ):
 
-                _, key = operation
+                key = operation[1]
 
                 self._encode_delete(key)
 
@@ -314,6 +321,31 @@ class Database:
                 self._recover()
 
                 return self.index.get(key)
+
+    def key_count(self):
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return len(self.index)
+
+    def items(self):
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return list(self.index.items())
+
+    def check(self):
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+
+                return True
 
     # --------------------------------
     # DELETE
