@@ -32,7 +32,7 @@ def read_batch_operations(batch_file):
                     raise ValueError(
                         "Malformed DEL operation on line {}".format(line_number)
                     )
-                operations.append(("delete", parts[1].encode("utf-8"), None))
+                operations.append(("delete", parts[1].encode("utf-8")))
             else:
                 raise ValueError(
                     "Invalid operation on line {}: {}".format(line_number, operation)

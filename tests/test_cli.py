@@ -166,7 +166,7 @@ class CliTests(unittest.TestCase):
             "café".encode("utf-8"): "こんにちは".encode("utf-8")
         })
 
-    def test_batch_calls_database_once_with_encoded_operations(self):
+    def test_batch_passes_put_and_delete_shapes_once_to_database(self):
         batch_file = self.write_batch_file(
             "PUT name Rahul\nPUT age 20\nDEL old\n"
         )
@@ -184,7 +184,7 @@ class CliTests(unittest.TestCase):
             [
                 ("put", b"name", b"Rahul"),
                 ("put", b"age", b"20"),
-                ("delete", b"old", None),
+                ("delete", b"old"),
             ],
         )
 
