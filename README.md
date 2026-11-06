@@ -1,5 +1,64 @@
 # Aid_Map
 
+## Quick Judge Start
+
+Requirements: Python 3.7 or newer and the Aid_Map source files in this
+repository. The harness uses only Python's standard library; no third-party
+Python packages are required. The current workspace was verified with Python
+3.15.0.
+
+From the repository root, run the documented 500-iteration basic test:
+
+```powershell
+python torture.py --iterations 500 --seed 12345 --mode basic
+```
+
+For a quick check before a judging run:
+
+```powershell
+python -m unittest discover -s tests -p test_torture_harness.py -v
+python torture.py --iterations 5 --seed 12345 --mode basic
+python torture.py --iterations 1 --seed 12345 --mode large-value
+python torture.py --iterations 1 --seed 12345 --mode max-batch
+```
+
+Illustrative output (timing, ACK counts, and outcomes vary by run):
+
+```text
+Aid_Map Crash Torture
+Mode: basic
+Seed: 12345
+Iterations: 5
+Writer count: 2
+Independent oracle: enabled (fsynced JSONL)
+Database/artifact location: C:\Users\Judge\AppData\Local\Temp\aid-map-torture-example
+Retention: removed after complete PASS; retained otherwise
+ITER 1/5 PASS delay=2ms ACKed/sent=2/3 pending_at_kill=yes verification=recovered state matches an allowed serialized prefix
+SUMMARY PASS=5 FAIL=0 INCONCLUSIVE=0 ERROR=0 seed=12345 elapsed=1.42s verdict=PASS
+```
+
+`PASS` means the recovered state matches an allowed state derived from the
+independently fsynced request/ACK oracle. `FAIL` means the recovered state
+conflicts with that history. `INCONCLUSIVE` means the available history cannot
+establish a safe verdict; it is not a pass. `ERROR` identifies a harness or
+environment problem, such as a missing prerequisite or subprocess failure.
+Only a complete PASS exits with code 0. A pending request means the harness
+had sent a request but had not observed its response at kill time; it does not
+prove the process was inside `os.write()` or `fsync()`.
+
+The default run uses unique temporary database directories and removes them
+only after a complete PASS. On failure or inconclusive results it retains the
+database, oracle log, and `failure.json`, and prints their location. To retain
+artifacts for every outcome, select a parent directory:
+
+```powershell
+python torture.py --iterations 5 --seed 12345 --mode basic --workdir .\judge-artifacts
+```
+
+Reproduce a finding by rerunning the same mode, seed, and iteration count.
+Request generation is seeded, but operating-system scheduling means crash
+timing and therefore the exact observed history may differ.
+
 ## Database CLI
 
 The CLI stores data in a persistent database at `%LOCALAPPDATA%\Aid_Map\aid_map.kv`

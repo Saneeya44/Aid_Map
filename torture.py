@@ -45,31 +45,148 @@ def positive_integer(value):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Crash-consistency harness for the Aid_Map CLI"
+        description="Exercise Aid_Map crash recovery and compare it with an independent oracle.",
+        epilog=(
+            "Examples:\n"
+            "  python torture.py --iterations 500 --seed 12345 --mode basic\n"
+            "  python torture.py --iterations 1 --seed 12345 --mode large-value\n"
+            "  python torture.py --iterations 1 --seed 12345 --mode max-batch"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--iterations",
         type=positive_integer,
         default=500,
-        help="number of isolated crash iterations (default: 500)",
+        help="number of isolated runs (default: 500; heavy modes allow at most 5)",
     )
     parser.add_argument(
         "--seed",
         type=int,
         required=True,
-        help="seed for deterministic request generation and kill delays",
+        help="required seed for reproducible requests and kill delays",
     )
     parser.add_argument(
         "--mode",
         choices=KNOWN_MODES,
         default="basic",
-        help="scenario mode (default: basic)",
+        help="basic, maximum-value, or maximum-batch test (default: basic)",
     )
     parser.add_argument(
         "--workdir",
-        help="parent directory for a new unique run directory (default: temporary)",
+        help="retain artifacts in a new unique subdirectory here (default: temporary)",
     )
     return parser
+
+
+def check_prerequisites(root=ROOT, python_version=None, executable=None):
+    root = Path(root)
+    required_files = (
+        root / "src" / "cli.py",
+        root / "src" / "database.py",
+        root / "src" / "storage.py",
+        root / "src" / "locking.py",
+    )
+    missing = [str(path) for path in required_files if not path.is_file()]
+    if missing:
+        raise HarnessError(
+            "required project files are missing: {}".format(", ".join(missing))
+        )
+
+    version = sys.version_info if python_version is None else python_version
+    if tuple(version[:2]) < (3, 7):
+        raise HarnessError("Python 3.7 or newer is required")
+
+    python_executable = sys.executable if executable is None else executable
+    if not python_executable or not os.path.isfile(python_executable):
+        raise HarnessError(
+            "Python executable was not found; run this script with an installed Python"
+        )
+
+
+def _create_run_root(workdir):
+    if workdir is None:
+        return tempfile.mkdtemp(prefix="aid-map-torture-"), True
+    parent = os.path.abspath(workdir)
+    os.makedirs(parent, exist_ok=True)
+    return tempfile.mkdtemp(prefix="aid-map-torture-", dir=parent), False
+
+
+def _cleanup_run_root(run_root, temporary, preserve_artifacts):
+    if temporary and not preserve_artifacts:
+        import shutil
+        shutil.rmtree(run_root)
+
+
+def _safe_print(*values, **kwargs):
+    rendered = [
+        str(value).encode("ascii", "backslashreplace").decode("ascii")
+        for value in values
+    ]
+    print(*rendered, **kwargs)
+
+
+def _print_banner(mode, seed, iterations, run_root, temporary):
+    writers = 2 if mode == "basic" else 1
+    retention = "removed after complete PASS; retained otherwise" if temporary else "retained"
+    _safe_print("Aid_Map Crash Torture")
+    _safe_print("Mode: {}".format(mode))
+    _safe_print("Seed: {}".format(seed))
+    _safe_print("Iterations: {}".format(iterations))
+    _safe_print("Writer count: {}".format(writers))
+    _safe_print("Independent oracle: enabled (fsynced JSONL)")
+    _safe_print("Database/artifact location: {}".format(run_root))
+    _safe_print("Retention: {}".format(retention))
+
+
+def _print_iteration(number, total, result, mode=None):
+    acked = sum(
+        response[0] == "ACK"
+        for response in result.get("statuses", {}).values()
+    )
+    sent = result.get("sent_count", len(result.get("attempts", [])))
+    pending = result.get(
+        "pending_at_kill",
+        result.get("protocol_pending_at_kill", False),
+    )
+    delay = result.get("kill_delay_ms", "n/a")
+    reason = " ".join(str(result.get("reason", "no result")).split())
+    if len(reason) > 120:
+        reason = reason[:117] + "..."
+    label = "ITER {}/{} {}".format(number, total, result["result"])
+    if mode:
+        label += " mode={}".format(mode)
+    _safe_print(
+        "{} delay={}ms ACKed/sent={}/{} pending_at_kill={} verification={}".format(
+            label,
+            delay,
+            acked,
+            sent,
+            "yes" if pending else "no",
+            reason,
+        ),
+        flush=True,
+    )
+
+
+def _print_summary(passed, failed, inconclusive, seed, started_at, verdict, errors=0):
+    elapsed = time.monotonic() - started_at
+    _safe_print(
+        "SUMMARY PASS={} FAIL={} INCONCLUSIVE={} ERROR={} seed={} "
+        "elapsed={:.2f}s verdict={}".format(
+            passed, failed, inconclusive, errors, seed, elapsed, verdict
+        ),
+        flush=True,
+    )
+    return elapsed
+
+
+def _write_failure_metadata(directory, metadata):
+    path = Path(directory) / "failure.json"
+    with open(path, "w", encoding="ascii") as file:
+        json.dump(metadata, file, sort_keys=True, indent=2, ensure_ascii=True)
+        file.write("\n")
+    return path
 
 
 def parse_response(line):
@@ -598,6 +715,7 @@ class IterationRunner:
         self.sent_condition = threading.Condition()
         self.sent_count = 0
         self.attempts = []
+        self.sent_ids = []
         self.attempt_lock = threading.Lock()
         self.sequence_lock = threading.Lock()
         self.send_lock = threading.Lock()
@@ -735,6 +853,7 @@ class IterationRunner:
                         "id": request["id"],
                         "sequence": sequence,
                     })
+                    self.sent_ids.append(request["id"])
                     self.sent_count += 1
                     self.first_sent.set()
                 time.sleep(delay)
@@ -791,6 +910,7 @@ class IterationRunner:
                         "id": operation_id,
                         "sequence": sequence,
                     })
+                    self.sent_ids.append(operation_id)
                     self.sent_count += 1
                     self.first_sent.set()
                     if request_index == target_index:
@@ -987,11 +1107,28 @@ class IterationRunner:
         time.sleep(kill_delay_ms / 1000)
         with self.active_lock:
             active_at_kill = self.active_writers > 0
-        self.oracle.record({
-            "event": "kill",
-            "delay_ms": kill_delay_ms,
-            "writers_active": active_at_kill,
-        })
+        with self.send_lock:
+            with self.status_lock:
+                pending_ids = [
+                    operation_id
+                    for operation_id in self.sent_ids
+                    if operation_id not in self.statuses
+                ]
+                server_alive_at_kill = self.process.poll() is None
+                self.oracle.record({
+                    "event": "kill",
+                    "delay_ms": kill_delay_ms,
+                    "writers_active": active_at_kill,
+                    "server_alive": server_alive_at_kill,
+                    "pending_at_kill": bool(pending_ids),
+                    "pending_operation_ids": pending_ids,
+                })
+                if server_alive_at_kill:
+                    try:
+                        self.process.kill()
+                    except OSError:
+                        if self.process.poll() is None:
+                            raise
         self._stop_and_reap()
 
         for writer in writers:
@@ -1005,6 +1142,14 @@ class IterationRunner:
                 "reason": "; ".join(self.reader_errors),
                 "kill_delay_ms": kill_delay_ms,
                 "active_at_kill": active_at_kill,
+                "pending_at_kill": bool(pending_ids),
+                "protocol_pending_at_kill": bool(pending_ids),
+                "server_alive_at_kill": server_alive_at_kill,
+                "sent_count": len(self.sent_ids),
+                "statuses": dict(self.statuses),
+                "attempts": self.attempts,
+                "candidates": [],
+                "actual": None,
             }
 
         actual_state = read_recovered_dump(self.database_path)
@@ -1022,6 +1167,9 @@ class IterationRunner:
         if not active_at_kill and result != "FAIL":
             result = "INCONCLUSIVE"
             explanation = "force-kill occurred after writers were no longer active"
+        elif not server_alive_at_kill and result != "FAIL":
+            result = "INCONCLUSIVE"
+            explanation = "SERVE had exited before the force-kill"
 
         self.oracle.record({
             "event": "verification",
@@ -1046,6 +1194,10 @@ class IterationRunner:
             "reason": explanation,
             "kill_delay_ms": kill_delay_ms,
             "active_at_kill": active_at_kill,
+            "pending_at_kill": bool(pending_ids),
+            "protocol_pending_at_kill": bool(pending_ids),
+            "server_alive_at_kill": server_alive_at_kill,
+            "sent_count": len(self.sent_ids),
             "attempts": self.attempts,
             "statuses": statuses,
             "candidates": candidates,
@@ -1102,140 +1254,177 @@ def _format_state(state):
     }
 
 
-def _iteration_requests(result):
-    return [
-        event["request"]["id"]
-        for event in result.get("attempts", [])
-    ]
+def _exit_code(passed, failed, inconclusive, errors=0):
+    if errors:
+        return 3
+    if failed:
+        return 1
+    if inconclusive or not passed:
+        return 2
+    return 0
+
+
+def _failure_metadata(seed, mode, iteration, result, error=None):
+    return {
+        "seed": seed,
+        "mode": mode,
+        "iteration": iteration,
+        "result": result.get("result", "ERROR"),
+        "reason": str(error if error is not None else result.get("reason", "")),
+        "kill_delay_ms": result.get("kill_delay_ms"),
+        "pending_at_kill": result.get("pending_at_kill"),
+        "protocol_pending_at_kill": result.get("protocol_pending_at_kill"),
+        "operation_ids": [
+            event.get("request", {}).get("id")
+            for event in result.get("attempts", [])
+            if isinstance(event.get("request"), dict)
+        ],
+        "expected_candidates": [
+            _format_state(state)
+            for state in result.get("candidates", [])
+        ],
+        "actual_state": (
+            _format_state(result["actual"])
+            if isinstance(result.get("actual"), dict)
+            else None
+        ),
+    }
+
+
+def _report_failure(result, seed, iteration, mode, directory, error=None):
+    metadata_path = _write_failure_metadata(
+        directory,
+        _failure_metadata(seed, mode, iteration, result, error),
+    )
+    _safe_print(
+        "Evidence retained: {} (database, oracle.jsonl, failure.json)".format(
+            directory
+        ),
+        flush=True,
+    )
+    _safe_print("Failure metadata: {}".format(metadata_path), flush=True)
 
 
 def run_basic(iterations, seed, workdir=None):
+    started_at = time.monotonic()
     generator = random.Random(seed)
-    if workdir is None:
-        temporary = tempfile.TemporaryDirectory(prefix="aid-map-torture-")
-        run_root = temporary.name
-    else:
-        parent = os.path.abspath(workdir)
-        os.makedirs(parent, exist_ok=True)
-        run_root = tempfile.mkdtemp(prefix="aid-map-torture-", dir=parent)
-        temporary = None
+    run_root, temporary = _create_run_root(workdir)
+    _print_banner("basic", seed, iterations, run_root, temporary)
 
-    passed = failed = inconclusive = 0
-    first_failure = None
+    passed = failed = inconclusive = errors = 0
+    preserve_artifacts = not temporary
     try:
-        for iteration in range(iterations):
+        for iteration in range(1, iterations + 1):
             iteration_directory = os.path.join(
-                run_root, "iteration-{:06d}".format(iteration + 1)
+                run_root, "iteration-{:06d}".format(iteration)
             )
             os.mkdir(iteration_directory)
-            runner = IterationRunner(iteration_directory, iteration + 1, generator)
+            runner = IterationRunner(iteration_directory, iteration, generator)
+            result = None
+            infrastructure_error = None
             try:
                 result = runner.run()
             except Exception as error:
-                failed += 1
-                first_failure = {
-                    "iteration": iteration + 1,
-                    "reason": str(error),
+                infrastructure_error = error
+                result = {
+                    "result": "ERROR",
+                    "reason": "harness/environment error: {}".format(error),
                     "attempts": runner.attempts,
-                    "actual": None,
+                    "statuses": dict(runner.statuses),
+                    "sent_count": len(runner.sent_ids),
                     "candidates": [],
+                    "actual": None,
+                    "kill_delay_ms": None,
+                    "pending_at_kill": None,
                 }
-                print(
-                    "ITER {}/{} FAIL {}".format(
-                        iteration + 1, iterations, error
-                    ),
-                    flush=True,
-                )
-                break
             finally:
-                runner.close()
+                try:
+                    runner.close()
+                except Exception as error:
+                    if infrastructure_error is None:
+                        infrastructure_error = error
+                        result = {
+                            "result": "ERROR",
+                            "reason": "harness/environment cleanup error: {}".format(error),
+                            "attempts": runner.attempts,
+                            "statuses": dict(runner.statuses),
+                            "sent_count": len(runner.sent_ids),
+                            "candidates": [],
+                            "actual": None,
+                            "kill_delay_ms": None,
+                            "pending_at_kill": None,
+                        }
 
             if result["result"] == "PASS":
                 passed += 1
             elif result["result"] == "FAIL":
                 failed += 1
-                first_failure = result
-            else:
+                preserve_artifacts = True
+            elif result["result"] == "INCONCLUSIVE":
                 inconclusive += 1
+                preserve_artifacts = True
+            else:
+                errors += 1
+                preserve_artifacts = True
 
-            print(
-                "ITER {}/{} {} delay={}ms active={} acked={}/{} {}".format(
-                    iteration + 1,
-                    iterations,
-                    result["result"],
-                    result["kill_delay_ms"],
-                    result["active_at_kill"],
-                    sum(status[0] == "ACK" for status in result.get("statuses", {}).values()),
-                    len(result.get("attempts", [])),
-                    result["reason"],
-                ),
-                flush=True,
-            )
-            if result["result"] == "FAIL":
+            if result["result"] != "PASS":
+                try:
+                    _report_failure(
+                        result,
+                        seed,
+                        iteration,
+                        "basic",
+                        iteration_directory,
+                        infrastructure_error,
+                    )
+                except OSError as error:
+                    errors += 1
+                    result["reason"] = "{}; unable to write failure metadata: {}".format(
+                        result["reason"], error
+                    )
+            _print_iteration(iteration, iterations, result)
+
+            if result["result"] in ("FAIL", "ERROR"):
                 break
 
-        if first_failure:
-            attempted_ids = _iteration_requests(first_failure)
-            print("FIRST FAILURE seed={} iteration={}".format(
-                seed, first_failure["iteration"]
-            ))
-            print("Operation IDs: {}".format(", ".join(attempted_ids) or "(none)"))
-            print("Reason: {}".format(first_failure["reason"]))
-            print("Expected possibilities: {}".format(
-                json.dumps(
-                    [_format_state(state) for state in first_failure.get("candidates", [])],
-                    sort_keys=True,
-                )
-            ))
-            actual = first_failure.get("actual")
-            print("Actual recovered state: {}".format(
-                json.dumps(_format_state(actual), sort_keys=True)
-                if isinstance(actual, dict)
-                else "(unavailable)"
-            ))
-
-        print(
-            "SUMMARY PASS={} FAIL={} INCONCLUSIVE={} seed={} iterations={}".format(
-                passed, failed, inconclusive, seed, iterations
-            ),
-            flush=True,
+        verdict = (
+            "ERROR" if errors else
+            "FAIL" if failed else
+            "INCONCLUSIVE" if inconclusive else
+            "PASS" if passed == iterations else
+            "ERROR"
         )
-        if temporary is None:
-            print("Artifacts: {}".format(run_root), flush=True)
-
-        if failed:
-            return 1
-        if inconclusive:
-            return 2
-        return 0
+        _print_summary(
+            passed, failed, inconclusive, seed, started_at, verdict, errors
+        )
+        if temporary and preserve_artifacts:
+            print("Artifacts retained: {}".format(run_root), flush=True)
+        code = _exit_code(passed, failed, inconclusive, errors)
+        return code
+    except Exception:
+        preserve_artifacts = True
+        raise
     finally:
-        if temporary is not None:
-            temporary.cleanup()
+        _cleanup_run_root(run_root, temporary, preserve_artifacts)
 
 
 def run_heavy_mode(mode, iterations, seed, workdir=None):
     if iterations > MAX_HEAVY_ITERATIONS:
         print(
-            "ERROR: {} is limited to {} iterations to bound disk usage".format(
+            "HARNESS ERROR: {} is limited to {} iterations to bound disk usage".format(
                 mode, MAX_HEAVY_ITERATIONS
             ),
             file=sys.stderr,
         )
         return 2
 
+    started_at = time.monotonic()
     generator = random.Random(seed)
-    if workdir is None:
-        temporary = tempfile.TemporaryDirectory(prefix="aid-map-torture-")
-        run_root = temporary.name
-    else:
-        parent = os.path.abspath(workdir)
-        os.makedirs(parent, exist_ok=True)
-        run_root = tempfile.mkdtemp(prefix="aid-map-torture-", dir=parent)
-        temporary = None
+    run_root, temporary = _create_run_root(workdir)
+    _print_banner(mode, seed, iterations, run_root, temporary)
 
-    passed = failed = inconclusive = 0
-    first_failure = None
-    case_number = 0
+    passed = failed = inconclusive = errors = 0
+    preserve_artifacts = not temporary
     try:
         for iteration in range(1, iterations + 1):
             iteration_directory = os.path.join(
@@ -1256,8 +1445,9 @@ def run_heavy_mode(mode, iterations, seed, workdir=None):
                     0,
                 )]
 
+            case_results = []
+            iteration_failed = False
             for case_index, (case_name, requests, target_index) in enumerate(cases):
-                case_number += 1
                 case_directory = os.path.join(
                     iteration_directory,
                     "case-{:02d}-{}".format(case_index + 1, case_name),
@@ -1269,126 +1459,191 @@ def run_heavy_mode(mode, iterations, seed, workdir=None):
                     generator,
                 )
                 delay = generator.uniform(0.0, 0.001)
+                infrastructure_error = None
                 try:
                     result = runner.run_stress(requests, target_index, delay)
                 except Exception as error:
-                    failed += 1
-                    first_failure = {
-                        "iteration": iteration,
-                        "case": case_name,
-                        "reason": str(error),
+                    infrastructure_error = error
+                    result = {
+                        "result": "ERROR",
+                        "reason": "harness/environment error: {}".format(error),
                         "attempts": runner.attempts,
+                        "statuses": dict(runner.statuses),
+                        "sent_count": len(runner.sent_ids),
+                        "pending_at_kill": None,
+                        "protocol_pending_at_kill": None,
+                        "kill_delay_ms": round(delay * 1000, 3),
                         "actual": None,
                         "candidates": [],
                     }
-                    print(
-                        "ITER {}/{} {} FAIL {}".format(
-                            iteration, iterations, case_name, error
-                        ),
-                        flush=True,
-                    )
-                    runner.close()
-                    break
                 finally:
-                    runner.close()
+                    try:
+                        runner.close()
+                    except Exception as error:
+                        if infrastructure_error is None:
+                            infrastructure_error = error
+                            result = {
+                                "result": "ERROR",
+                                "reason": "harness/environment cleanup error: {}".format(error),
+                                "attempts": runner.attempts,
+                                "statuses": dict(runner.statuses),
+                                "sent_count": len(runner.sent_ids),
+                                "pending_at_kill": None,
+                                "protocol_pending_at_kill": None,
+                                "kill_delay_ms": round(delay * 1000, 3),
+                                "actual": None,
+                                "candidates": [],
+                            }
 
                 if result["result"] == "PASS":
-                    passed += 1
+                    pass
                 elif result["result"] == "FAIL":
-                    failed += 1
-                    first_failure = dict(result, iteration=iteration, case=case_name)
+                    iteration_failed = True
+                    preserve_artifacts = True
                 else:
-                    inconclusive += 1
+                    preserve_artifacts = True
 
-                print(
-                    "ITER {}/{} {} {} delay={}ms server_alive={} "
-                    "pending={} acked={}/{} {}".format(
-                        iteration,
-                        iterations,
-                        case_name,
-                        result["result"],
-                        result["kill_delay_ms"],
-                        result["server_alive_at_kill"],
-                        result["pending_at_kill"],
-                        sum(
-                            response[0] == "ACK"
-                            for response in result["statuses"].values()
-                        ),
-                        len(result["attempts"]),
-                        result["reason"],
-                    ),
-                    flush=True,
-                )
-                if result["result"] == "FAIL":
+                if result["result"] != "PASS":
+                    try:
+                        _report_failure(
+                            result,
+                            seed,
+                            iteration,
+                            "{}:{}".format(mode, case_name),
+                            case_directory,
+                            infrastructure_error,
+                        )
+                    except OSError as error:
+                        errors += 1
+                        result["reason"] = (
+                            "{}; unable to write failure metadata: {}".format(
+                                result["reason"], error
+                            )
+                        )
+                result["case"] = case_name
+                case_results.append(result)
+                if result["result"] in ("FAIL", "ERROR"):
                     break
-            if failed:
+
+            if iteration_failed:
+                status = "FAIL"
+            elif any(result["result"] == "ERROR" for result in case_results):
+                status = "ERROR"
+            elif any(result["result"] == "INCONCLUSIVE" for result in case_results):
+                status = "INCONCLUSIVE"
+            else:
+                status = "PASS"
+            if status == "PASS":
+                passed += 1
+            elif status == "FAIL":
+                failed += 1
+            elif status == "ERROR":
+                errors += 1
+            else:
+                inconclusive += 1
+            pending_count = sum(
+                result.get("pending_at_kill") is True
+                for result in case_results
+            )
+            reasons = "; ".join(
+                "{}: {}".format(result["case"], result["reason"])
+                for result in case_results
+            )
+            combined = {
+                "result": status,
+                "reason": reasons,
+                "kill_delay_ms": ",".join(
+                    str(result.get("kill_delay_ms", "n/a"))
+                    for result in case_results
+                ),
+                "pending_at_kill": pending_count > 0,
+                "statuses": {
+                    operation_id: response
+                    for result in case_results
+                    for operation_id, response in result.get("statuses", {}).items()
+                },
+                "sent_count": sum(
+                    result.get("sent_count", len(result.get("attempts", [])))
+                    for result in case_results
+                ),
+            }
+            _print_iteration(iteration, iterations, combined, mode)
+            if status in ("FAIL", "ERROR"):
                 break
 
-        if first_failure:
-            print(
-                "FIRST FAILURE seed={} iteration={} case={}".format(
-                    seed,
-                    first_failure["iteration"],
-                    first_failure["case"],
-                )
-            )
-            print("Operation IDs: {}".format(
-                ", ".join(_iteration_requests(first_failure)) or "(none)"
-            ))
-            print("Reason: {}".format(first_failure["reason"]))
-            print("Expected possibilities: {}".format(
-                json.dumps(
-                    [
-                        _format_state(state)
-                        for state in first_failure.get("candidates", [])
-                    ],
-                    sort_keys=True,
-                )
-            ))
-            actual = first_failure.get("actual")
-            print("Actual recovered state: {}".format(
-                json.dumps(_format_state(actual), sort_keys=True)
-                if isinstance(actual, dict)
-                else "(unavailable)"
-            ))
-
-        print(
-            "SUMMARY PASS={} FAIL={} INCONCLUSIVE={} seed={} iterations={} "
-            "cases={} mode={}".format(
-                passed, failed, inconclusive, seed, iterations, case_number, mode
-            ),
-            flush=True,
+        verdict = (
+            "ERROR" if errors else
+            "FAIL" if failed else
+            "INCONCLUSIVE" if inconclusive else
+            "PASS" if passed == iterations else
+            "ERROR"
         )
-        if temporary is None:
-            print("Artifacts: {}".format(run_root), flush=True)
-
-        if failed:
-            return 1
-        if inconclusive:
-            return 2
-        return 0
+        _print_summary(
+            passed, failed, inconclusive, seed, started_at, verdict, errors
+        )
+        if temporary and preserve_artifacts:
+            _safe_print("Artifacts retained: {}".format(run_root), flush=True)
+        return _exit_code(passed, failed, inconclusive, errors)
+    except Exception:
+        preserve_artifacts = True
+        raise
     finally:
-        if temporary is not None:
-            temporary.cleanup()
+        _cleanup_run_root(run_root, temporary, preserve_artifacts)
 
 
 def main(argv=None):
+    started_at = time.monotonic()
     args = build_parser().parse_args(argv)
+    try:
+        check_prerequisites()
+    except HarnessError as error:
+        _safe_print("HARNESS/ENVIRONMENT ERROR: {}".format(error), file=sys.stderr)
+        _print_summary(0, 0, 0, args.seed, started_at, "ERROR", errors=1)
+        return 3
+
     if args.mode not in SUPPORTED_MODES:
-        print("NOT IMPLEMENTED: mode {}".format(args.mode))
-        print(
-            "SUMMARY PASS=0 FAIL=0 INCONCLUSIVE=0 NOT_IMPLEMENTED=1 seed={} "
-            "iterations={}".format(args.seed, args.iterations)
+        _safe_print("Aid_Map Crash Torture")
+        _safe_print("Mode: {}".format(args.mode))
+        _safe_print("Seed: {}".format(args.seed))
+        _safe_print("Iterations: {}".format(args.iterations))
+        _safe_print("Writer count: 0")
+        _safe_print("Independent oracle: enabled")
+        _safe_print("Database/artifact location: not created")
+        _safe_print("Retention: no run started")
+        _safe_print(
+            "NOT IMPLEMENTED: mode {}".format(args.mode),
+            file=sys.stderr,
+        )
+        _print_summary(0, 0, 0, args.seed, started_at, "NOT_IMPLEMENTED", errors=1)
+        return 2
+    if args.mode in ("large-value", "max-batch") and args.iterations > MAX_HEAVY_ITERATIONS:
+        _safe_print(
+            "HARNESS/ARGUMENT ERROR: {} allows at most {} iterations".format(
+                args.mode, MAX_HEAVY_ITERATIONS
+            ),
+            file=sys.stderr,
+        )
+        _print_summary(
+            0, 0, 0, args.seed, started_at, "INVALID_ARGUMENT", errors=1
         )
         return 2
-    if args.mode in ("large-value", "max-batch"):
-        return run_heavy_mode(
-            args.mode,
-            args.iterations,
-            args.seed,
-            args.workdir,
+    try:
+        if args.mode in ("large-value", "max-batch"):
+            return run_heavy_mode(
+                args.mode,
+                args.iterations,
+                args.seed,
+                args.workdir,
+            )
+        return run_basic(args.iterations, args.seed, args.workdir)
+    except (OSError, HarnessError, ValueError) as error:
+        _safe_print(
+            "HARNESS/ENVIRONMENT ERROR: {}".format(error),
+            file=sys.stderr,
+            flush=True,
         )
-    return run_basic(args.iterations, args.seed, args.workdir)
+        _print_summary(0, 0, 0, args.seed, started_at, "ERROR", errors=1)
+        return 3
 
 
 if __name__ == "__main__":
