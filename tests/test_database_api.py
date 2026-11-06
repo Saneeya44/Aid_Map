@@ -62,6 +62,7 @@ class DatabaseReadOnlyApiTests(unittest.TestCase):
         self.database.put(b"name", b"Anu")
 
         self.assertIs(self.database.check(), True)
+        self.assertIs(Database.check_file(self.database_path), True)
 
     def test_check_raises_for_checksum_corruption(self):
         self.database.put(b"name", b"Anu")
@@ -73,7 +74,7 @@ class DatabaseReadOnlyApiTests(unittest.TestCase):
             database_file.write(bytes([last_byte[0] ^ 0x01]))
 
         with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
-            self.database.check()
+            Database.check_file(self.database_path)
 
     def test_read_only_methods_reject_closed_database(self):
         self.database.close()

@@ -48,53 +48,64 @@ def append_record(path, record_type, payload):
         os.close(fd)
 
 
-def read_records(path):     
+def _read_records(file, repair_incomplete):
     records = []
 
-    with open(path, "r+b") as file:
+    while True:
+        record_start = file.tell()
 
-        while True:
-            record_start = file.tell()
+        # Read the header
+        header = file.read(HEADER_SIZE)
 
-            # Read the header
-            header = file.read(HEADER_SIZE)
+        # No more records
+        if not header:
+            break
 
-            # No more records
-            if not header:
-                break
+        # Incomplete header
+        if len(header) != HEADER_SIZE:
+            if not repair_incomplete:
+                raise ValueError("Incomplete trailing record header")
+            file.truncate(record_start)
+            file.flush()
+            os.fsync(file.fileno())
+            break
 
-            # Incomplete header: remove incomplete record
-            if len(header) != HEADER_SIZE:
-                file.truncate(record_start)
-                file.flush()
-                os.fsync(file.fileno())
-                break
+        magic, version, record_type, length, checksum = (
+            struct.unpack(HEADER_FORMAT, header)
+        )
 
-            magic, version, record_type, length, checksum = (
-                struct.unpack(HEADER_FORMAT, header)
-            )
+        # Validate header
+        if magic != MAGIC or version != VERSION:
+            raise ValueError("Invalid record header")
 
-            # Validate header
-            if magic != MAGIC or version != VERSION:
-                raise ValueError("Invalid record header")
+        # Read payload
+        payload = file.read(length)
 
-            # Read payload
-            payload = file.read(length)
+        # Incomplete payload
+        if len(payload) != length:
+            if not repair_incomplete:
+                raise ValueError("Incomplete trailing record payload")
+            file.truncate(record_start)
+            file.flush()
+            os.fsync(file.fileno())
+            break
 
-            # Incomplete payload: remove incomplete record
-            if len(payload) != length:
-                file.truncate(record_start)
-                file.flush()
-                os.fsync(file.fileno())
-                break
+        # Verify checksum
+        checksum_data = bytes([version, record_type]) + payload
 
-            # Verify checksum
-            checksum_data = bytes([version, record_type]) + payload
+        if zlib.crc32(checksum_data) != checksum:
+            raise ValueError("Checksum mismatch")
 
-            if zlib.crc32(checksum_data) != checksum:
-                raise ValueError("Checksum mismatch")
-
-            records.append((record_type, payload))
+        records.append((record_type, payload))
 
     return records
-    
+
+
+def read_records(path):
+    with open(path, "r+b") as file:
+        return _read_records(file, repair_incomplete=True)
+
+
+def verify_records(path):
+    with open(path, "rb") as file:
+        return _read_records(file, repair_incomplete=False)

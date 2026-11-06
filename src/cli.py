@@ -161,6 +161,18 @@ def main(argv=None):
         else:
             from src.database import Database
 
+        if args.command == "check":
+            check_file = getattr(Database, "check_file", None)
+            if not callable(check_file):
+                raise ValueError(
+                    "Database.check_file() is not available; "
+                    "the storage engine must implement it"
+                )
+            if check_file(path) is not True:
+                raise ValueError("Database.check_file() did not confirm integrity")
+            print("OK: database integrity verified")
+            return 0
+
         open_started = time.perf_counter() if args.command == "open" else None
         db = Database(path)
 
@@ -191,18 +203,6 @@ def main(argv=None):
                 encoded_key = base64.b64encode(key).decode("ascii")
                 encoded_value = base64.b64encode(value).decode("ascii")
                 print("key={} value={}".format(encoded_key, encoded_value))
-            return 0
-
-        if args.command == "check":
-            check_method = getattr(db, "check", None)
-            if not callable(check_method):
-                raise ValueError(
-                    "Database.check() is not available; "
-                    "the storage engine must implement it"
-                )
-            if check_method() is not True:
-                raise ValueError("Database.check() did not confirm integrity")
-            print("OK: database integrity verified")
             return 0
 
         if args.command == "batch":

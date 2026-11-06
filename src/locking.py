@@ -4,19 +4,23 @@ import sys
 
 
 class FileLock:
-    def __init__(self, path):
+    def __init__(self, path, create=True):
         self.path = path
+        self.create = create
         self.file = None
 
     def __enter__(self):
-        self.file = open(self.path, "a+b")
+        if self.create:
+            self.file = open(self.path, "a+b")
 
-        # Windows needs at least one byte to lock.
-        self.file.seek(0, os.SEEK_END)
+            # Windows needs at least one byte to lock.
+            self.file.seek(0, os.SEEK_END)
 
-        if self.file.tell() == 0:
-            self.file.write(b"\0")
-            self.file.flush()
+            if self.file.tell() == 0:
+                self.file.write(b"\0")
+                self.file.flush()
+        else:
+            self.file = open(self.path, "r+b")
 
         self.file.seek(0)
 
