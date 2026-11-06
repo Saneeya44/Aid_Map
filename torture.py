@@ -13,7 +13,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-SUPPORTED_MODES = ("basic",)
 KNOWN_MODES = (
     "basic",
     "large-value",
@@ -22,8 +21,12 @@ KNOWN_MODES = (
     "compaction-crash",
     "disk-full",
 )
+SUPPORTED_MODES = ("basic", "large-value", "max-batch")
 PROCESS_TIMEOUT = 15
 READER_TIMEOUT = 10
+MAX_HEAVY_ITERATIONS = 5
+MAX_VALUE_LENGTH = 1024 * 1024
+MAX_BATCH_OPERATIONS = 10000
 
 
 class HarnessError(Exception):
@@ -502,6 +505,84 @@ def _b64(value):
     return base64.b64encode(value).decode("ascii")
 
 
+def make_large_value_scenarios(generator):
+    key = b"large-value-key"
+    first_byte = generator.randrange(256)
+    overwrite_byte = (first_byte + 1) % 256
+    delete_byte = (overwrite_byte + 1) % 256
+    first_value = bytes([first_byte]) * MAX_VALUE_LENGTH
+    overwrite_value = bytes([overwrite_byte]) * MAX_VALUE_LENGTH
+    delete_value = bytes([delete_byte]) * MAX_VALUE_LENGTH
+    return [
+        (
+            "large-put",
+            [{
+                "id": None,
+                "op": "put",
+                "key": _b64(key),
+                "value": _b64(first_value),
+            }],
+        ),
+        (
+            "large-overwrite",
+            [
+                {
+                    "id": None,
+                    "op": "put",
+                    "key": _b64(key),
+                    "value": _b64(first_value),
+                },
+                {
+                    "id": None,
+                    "op": "put",
+                    "key": _b64(key),
+                    "value": _b64(overwrite_value),
+                },
+            ],
+        ),
+        (
+            "large-delete",
+            [
+                {
+                    "id": None,
+                    "op": "put",
+                    "key": _b64(key),
+                    "value": _b64(delete_value),
+                },
+                {
+                    "id": None,
+                    "op": "delete",
+                    "key": _b64(key),
+                },
+            ],
+        ),
+    ]
+
+
+def make_max_batch_request(generator):
+    key_count = 128
+    operations = []
+    for index in range(MAX_BATCH_OPERATIONS):
+        key = ("batch-key-{:03d}".format(index % key_count)).encode("ascii")
+        if index == 0 or (index > 1 and generator.randrange(2)):
+            value = ("value-{:05d}".format(index)).encode("ascii")
+            operations.append({
+                "op": "put",
+                "key": _b64(key),
+                "value": _b64(value),
+            })
+        else:
+            operations.append({
+                "op": "delete",
+                "key": _b64(key),
+            })
+    return {
+        "id": None,
+        "op": "batch",
+        "operations": operations,
+    }
+
+
 class IterationRunner:
     def __init__(self, directory, iteration, generator):
         self.directory = Path(directory)
@@ -511,6 +592,7 @@ class IterationRunner:
         self.generator = generator
         self.status_lock = threading.Lock()
         self.statuses = {}
+        self.response_condition = threading.Condition(self.status_lock)
         self.reader_errors = []
         self.stderr_lines = []
         self.sent_condition = threading.Condition()
@@ -523,6 +605,8 @@ class IterationRunner:
         self.active_lock = threading.Lock()
         self.active_writers = 0
         self.first_sent = threading.Event()
+        self.target_sent = threading.Event()
+        self.target_operation_id = None
         self.writer_errors = []
         self.process = None
         self.writers = []
@@ -535,19 +619,20 @@ class IterationRunner:
             self.reader_errors.append("{}: {!r}".format(error, line))
             return
 
-        self.oracle.record({
-            "event": "response",
-            "id": operation_id,
-            "response": response_type,
-            "reason": reason,
-        })
         with self.status_lock:
             if operation_id in self.statuses:
                 self.reader_errors.append(
                     "duplicate response for {}".format(operation_id)
                 )
             else:
+                self.oracle.record({
+                    "event": "response",
+                    "id": operation_id,
+                    "response": response_type,
+                    "reason": reason,
+                })
                 self.statuses[operation_id] = (response_type, reason)
+                self.response_condition.notify_all()
 
     def _read_stdout(self):
         try:
@@ -661,6 +746,179 @@ class IterationRunner:
         finally:
             with self.active_lock:
                 self.active_writers -= 1
+
+    def _stress_writer(self, requests, target_index):
+        self.attempts_for_writer = [[]]
+        try:
+            for request_index, request in enumerate(requests[:target_index + 1]):
+                if self.stop_event.is_set():
+                    return
+
+                with self.send_lock:
+                    sequence = len(self.attempts)
+                    operation_id = "i{}-stress-op{}".format(
+                        self.iteration, request_index
+                    )
+                    request["id"] = operation_id
+                    event = {
+                        "event": "request",
+                        "sequence": sequence,
+                        "writer": 0,
+                        "request": request,
+                    }
+                    self.oracle.record(event)
+                    self.attempts.append(event)
+                    self.attempts_for_writer[0].append(event)
+                    try:
+                        self.process.stdin.write(
+                            json.dumps(request, separators=(",", ":")) + "\n"
+                        )
+                        self.process.stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError) as error:
+                        self.oracle.record({
+                            "event": "send_error",
+                            "id": operation_id,
+                            "reason": str(error),
+                        })
+                        self.writer_errors.append(
+                            "send {}: {}".format(operation_id, error)
+                        )
+                        self.stop_event.set()
+                        return
+
+                    self.oracle.record({
+                        "event": "sent",
+                        "id": operation_id,
+                        "sequence": sequence,
+                    })
+                    self.sent_count += 1
+                    self.first_sent.set()
+                    if request_index == target_index:
+                        self.target_operation_id = operation_id
+                        self.target_sent.set()
+                        return
+
+                deadline = time.monotonic() + PROCESS_TIMEOUT
+                with self.response_condition:
+                    while operation_id not in self.statuses:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self.writer_errors.append(
+                                "timed out waiting for ACK {}".format(operation_id)
+                            )
+                            self.stop_event.set()
+                            return
+                        self.response_condition.wait(timeout=remaining)
+                    response_type, reason = self.statuses[operation_id]
+                if response_type != "ACK":
+                    self.writer_errors.append(
+                        "precondition {} returned ERR: {}".format(
+                            operation_id, reason
+                        )
+                    )
+                    self.stop_event.set()
+                    return
+        except Exception as error:
+            self.writer_errors.append("stress writer: {}".format(error))
+            self.stop_event.set()
+
+    def run_stress(self, requests, target_index, kill_delay):
+        if not requests or not 0 <= target_index < len(requests):
+            raise ValueError("Stress request target is out of range")
+
+        self._start_server()
+        writer = threading.Thread(
+            target=self._stress_writer,
+            args=(requests, target_index),
+            daemon=True,
+        )
+        self.writers = [writer]
+        writer.start()
+
+        if not self.target_sent.wait(timeout=PROCESS_TIMEOUT):
+            raise HarnessError(
+                "Timed out waiting for stress operation to be sent: {}".format(
+                    "; ".join(self.writer_errors)
+                )
+            )
+
+        time.sleep(kill_delay)
+        with self.status_lock:
+            target_id = self.target_operation_id
+            pending_at_kill = target_id not in self.statuses
+            server_alive_at_kill = self.process.poll() is None
+            self.oracle.record({
+                "event": "kill",
+                "delay_ms": round(kill_delay * 1000, 3),
+                "server_alive": server_alive_at_kill,
+                "pending_at_kill": pending_at_kill,
+                "pending_operation_id": target_id if pending_at_kill else None,
+            })
+            if server_alive_at_kill:
+                try:
+                    self.process.kill()
+                except OSError:
+                    if self.process.poll() is None:
+                        raise
+
+        self._stop_and_reap()
+        if writer.is_alive():
+            raise HarnessError("Stress writer did not stop after force-kill")
+
+        if self.reader_errors:
+            result = "INCONCLUSIVE"
+            candidates = []
+            explanation = "; ".join(self.reader_errors)
+            actual_state = None
+        else:
+            actual_state = read_recovered_dump(self.database_path)
+            with self.status_lock:
+                statuses = dict(self.statuses)
+            result, candidates, explanation = verify_oracle_log(
+                self.oracle.path,
+                actual_state,
+            )
+            if self.writer_errors:
+                result = "INCONCLUSIVE"
+                explanation = "writer outcome uncertain: {}".format(
+                    "; ".join(self.writer_errors)
+                )
+            elif not server_alive_at_kill and result != "FAIL":
+                result = "INCONCLUSIVE"
+                explanation = "SERVE had exited before the force-kill"
+            elif not pending_at_kill and result != "FAIL":
+                result = "INCONCLUSIVE"
+                explanation = (
+                    "target operation had already been acknowledged at kill time"
+                )
+
+        with self.status_lock:
+            statuses = dict(self.statuses)
+        self.oracle.record({
+            "event": "verification",
+            "result": result,
+            "reason": explanation,
+            "acknowledged_ids": sorted(
+                operation_id
+                for operation_id, response in statuses.items()
+                if response[0] == "ACK"
+            ),
+            "candidate_states": [
+                _format_state(state) for state in candidates
+            ],
+        })
+        return {
+            "result": result,
+            "reason": explanation,
+            "kill_delay_ms": round(kill_delay * 1000, 3),
+            "server_alive_at_kill": server_alive_at_kill,
+            "pending_at_kill": pending_at_kill,
+            "target_operation_id": target_id,
+            "attempts": self.attempts,
+            "statuses": statuses,
+            "candidates": candidates,
+            "actual": actual_state,
+        }
 
     def _stop_and_reap(self):
         self.stop_event.set()
@@ -955,6 +1213,165 @@ def run_basic(iterations, seed, workdir=None):
             temporary.cleanup()
 
 
+def run_heavy_mode(mode, iterations, seed, workdir=None):
+    if iterations > MAX_HEAVY_ITERATIONS:
+        print(
+            "ERROR: {} is limited to {} iterations to bound disk usage".format(
+                mode, MAX_HEAVY_ITERATIONS
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    generator = random.Random(seed)
+    if workdir is None:
+        temporary = tempfile.TemporaryDirectory(prefix="aid-map-torture-")
+        run_root = temporary.name
+    else:
+        parent = os.path.abspath(workdir)
+        os.makedirs(parent, exist_ok=True)
+        run_root = tempfile.mkdtemp(prefix="aid-map-torture-", dir=parent)
+        temporary = None
+
+    passed = failed = inconclusive = 0
+    first_failure = None
+    case_number = 0
+    try:
+        for iteration in range(1, iterations + 1):
+            iteration_directory = os.path.join(
+                run_root, "iteration-{:06d}".format(iteration)
+            )
+            os.mkdir(iteration_directory)
+
+            if mode == "large-value":
+                scenarios = make_large_value_scenarios(generator)
+                cases = [
+                    (name, requests, len(requests) - 1)
+                    for name, requests in scenarios
+                ]
+            else:
+                cases = [(
+                    "max-batch",
+                    [make_max_batch_request(generator)],
+                    0,
+                )]
+
+            for case_index, (case_name, requests, target_index) in enumerate(cases):
+                case_number += 1
+                case_directory = os.path.join(
+                    iteration_directory,
+                    "case-{:02d}-{}".format(case_index + 1, case_name),
+                )
+                os.mkdir(case_directory)
+                runner = IterationRunner(
+                    case_directory,
+                    iteration * 10 + case_index,
+                    generator,
+                )
+                delay = generator.uniform(0.0, 0.001)
+                try:
+                    result = runner.run_stress(requests, target_index, delay)
+                except Exception as error:
+                    failed += 1
+                    first_failure = {
+                        "iteration": iteration,
+                        "case": case_name,
+                        "reason": str(error),
+                        "attempts": runner.attempts,
+                        "actual": None,
+                        "candidates": [],
+                    }
+                    print(
+                        "ITER {}/{} {} FAIL {}".format(
+                            iteration, iterations, case_name, error
+                        ),
+                        flush=True,
+                    )
+                    runner.close()
+                    break
+                finally:
+                    runner.close()
+
+                if result["result"] == "PASS":
+                    passed += 1
+                elif result["result"] == "FAIL":
+                    failed += 1
+                    first_failure = dict(result, iteration=iteration, case=case_name)
+                else:
+                    inconclusive += 1
+
+                print(
+                    "ITER {}/{} {} {} delay={}ms server_alive={} "
+                    "pending={} acked={}/{} {}".format(
+                        iteration,
+                        iterations,
+                        case_name,
+                        result["result"],
+                        result["kill_delay_ms"],
+                        result["server_alive_at_kill"],
+                        result["pending_at_kill"],
+                        sum(
+                            response[0] == "ACK"
+                            for response in result["statuses"].values()
+                        ),
+                        len(result["attempts"]),
+                        result["reason"],
+                    ),
+                    flush=True,
+                )
+                if result["result"] == "FAIL":
+                    break
+            if failed:
+                break
+
+        if first_failure:
+            print(
+                "FIRST FAILURE seed={} iteration={} case={}".format(
+                    seed,
+                    first_failure["iteration"],
+                    first_failure["case"],
+                )
+            )
+            print("Operation IDs: {}".format(
+                ", ".join(_iteration_requests(first_failure)) or "(none)"
+            ))
+            print("Reason: {}".format(first_failure["reason"]))
+            print("Expected possibilities: {}".format(
+                json.dumps(
+                    [
+                        _format_state(state)
+                        for state in first_failure.get("candidates", [])
+                    ],
+                    sort_keys=True,
+                )
+            ))
+            actual = first_failure.get("actual")
+            print("Actual recovered state: {}".format(
+                json.dumps(_format_state(actual), sort_keys=True)
+                if isinstance(actual, dict)
+                else "(unavailable)"
+            ))
+
+        print(
+            "SUMMARY PASS={} FAIL={} INCONCLUSIVE={} seed={} iterations={} "
+            "cases={} mode={}".format(
+                passed, failed, inconclusive, seed, iterations, case_number, mode
+            ),
+            flush=True,
+        )
+        if temporary is None:
+            print("Artifacts: {}".format(run_root), flush=True)
+
+        if failed:
+            return 1
+        if inconclusive:
+            return 2
+        return 0
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.mode not in SUPPORTED_MODES:
@@ -964,6 +1381,13 @@ def main(argv=None):
             "iterations={}".format(args.seed, args.iterations)
         )
         return 2
+    if args.mode in ("large-value", "max-batch"):
+        return run_heavy_mode(
+            args.mode,
+            args.iterations,
+            args.seed,
+            args.workdir,
+        )
     return run_basic(args.iterations, args.seed, args.workdir)
 
 

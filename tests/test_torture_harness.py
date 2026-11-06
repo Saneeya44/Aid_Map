@@ -1,9 +1,14 @@
 import base64
+import io
+import json
 import os
+import random
 import tempfile
 import unittest
 
 import torture
+from src.cli import serve
+from src.database import Database
 
 
 class TortureHarnessTests(unittest.TestCase):
@@ -63,7 +68,7 @@ class TortureHarnessTests(unittest.TestCase):
         }
         attempts = [{"sequence": 0, "request": request}]
 
-        status, candidates, explanation = torture.verify_oracle(
+        status, candidates, _ = torture.verify_oracle(
             attempts, {}, {b"key": b"value"}
         )
 
@@ -259,6 +264,97 @@ class TortureHarnessTests(unittest.TestCase):
         )
         self.assertEqual(status, "INCONCLUSIVE")
         self.assertEqual(candidates, [])
+
+    def test_large_value_mode_generates_exact_limit_overwrite_and_delete(self):
+        scenarios = torture.make_large_value_scenarios(
+            random.Random(41)
+        )
+        self.assertEqual(
+            [name for name, _ in scenarios],
+            ["large-put", "large-overwrite", "large-delete"],
+        )
+
+        put_request = scenarios[0][1][0]
+        self.assertEqual(put_request["op"], "put")
+        self.assertEqual(
+            len(base64.b64decode(put_request["value"])),
+            1024 * 1024,
+        )
+
+        overwrite_requests = scenarios[1][1]
+        self.assertEqual(
+            [request["op"] for request in overwrite_requests],
+            ["put", "put"],
+        )
+        self.assertEqual(
+            len(base64.b64decode(overwrite_requests[1]["value"])),
+            1024 * 1024,
+        )
+        self.assertNotEqual(
+            overwrite_requests[0]["value"],
+            overwrite_requests[1]["value"],
+        )
+
+        delete_requests = scenarios[2][1]
+        self.assertEqual(
+            [request["op"] for request in delete_requests],
+            ["put", "delete"],
+        )
+        self.assertEqual(
+            len(base64.b64decode(delete_requests[0]["value"])),
+            1024 * 1024,
+        )
+
+    def test_max_batch_mode_generates_exactly_10000_mixed_repeated_key_operations(self):
+        request = torture.make_max_batch_request(random.Random(17))
+        operations = request["operations"]
+        self.assertEqual(request["op"], "batch")
+        self.assertEqual(len(operations), 10000)
+        self.assertEqual(operations[0]["op"], "put")
+        self.assertEqual(operations[1]["op"], "delete")
+        self.assertEqual(
+            len({operation["key"] for operation in operations}),
+            128,
+        )
+        self.assertTrue(any(operation["op"] == "put" for operation in operations))
+        self.assertTrue(any(operation["op"] == "delete" for operation in operations))
+
+    def test_10001_operation_serve_batch_is_rejected_without_database_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, "oversize.kv")
+            with Database(database_path) as database:
+                database.put(b"keep", b"unchanged")
+
+            with open(database_path, "rb") as file:
+                before = file.read()
+
+            request = {
+                "id": "too-many",
+                "op": "batch",
+                "operations": [
+                    {
+                        "op": "delete",
+                        "key": base64.b64encode(b"repeat").decode("ascii"),
+                    }
+                    for _ in range(10001)
+                ],
+            }
+            output = io.StringIO()
+            error_output = io.StringIO()
+            exit_code = serve(
+                database_path,
+                input_stream=io.StringIO(json.dumps(request) + "\n"),
+                output_stream=output,
+                error_stream=error_output,
+            )
+
+            with open(database_path, "rb") as file:
+                after = file.read()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(output.getvalue().startswith("ERR too-many "))
+        self.assertEqual(error_output.getvalue(), "")
+        self.assertEqual(after, before)
 
     def test_verifier_returns_inconclusive_for_nonprefix_ack_history(self):
         attempts = [

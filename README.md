@@ -69,5 +69,10 @@ but OS scheduling means crash timing is not deterministic.
 The verifier requires all ACKed writes and allows the single next in-flight
 request to have committed or not. It reports INCONCLUSIVE rather than assuming
 an outcome when response/history evidence cannot establish a safe serialized
-order. `large-value`, `max-batch`, `recovery-crash`, `compaction-crash`, and
-`disk-full` modes are currently NOT IMPLEMENTED.
+order. `large-value` runs maximum-size PUT, overwrite, and delete crash cases;
+`max-batch` sends a mixed, repeated-key batch of exactly 10,000 operations.
+Both heavy modes are limited to five iterations per run. A heavy-mode case is
+reported as INCONCLUSIVE if its target request had already been ACKed when the
+process was killed; server liveness alone is not treated as proof that an
+operation was pending. `recovery-crash`, `compaction-crash`, and `disk-full`
+modes are currently NOT IMPLEMENTED.
