@@ -37,6 +37,12 @@ class FakeDatabase:
             raise FakeDatabase.check_error
         return FakeDatabase.check_result
 
+    @classmethod
+    def check_file(cls, path):
+        if cls.check_error is not None:
+            raise cls.check_error
+        return cls.check_result
+
     def put(self, key, value):
         if FakeDatabase.put_error is not None:
             raise FakeDatabase.put_error
@@ -166,7 +172,7 @@ class CliTests(unittest.TestCase):
             "café".encode("utf-8"): "こんにちは".encode("utf-8")
         })
 
-    def test_batch_calls_database_once_with_encoded_operations(self):
+    def test_batch_passes_put_and_delete_shapes_once_to_database(self):
         batch_file = self.write_batch_file(
             "PUT name Rahul\nPUT age 20\nDEL old\n"
         )
@@ -184,7 +190,7 @@ class CliTests(unittest.TestCase):
             [
                 ("put", b"name", b"Rahul"),
                 ("put", b"age", b"20"),
-                ("delete", b"old", None),
+                ("delete", b"old"),
             ],
         )
 
@@ -316,6 +322,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(stdout, "OK: database integrity verified\n")
         self.assertEqual(stderr, "")
+        self.assertEqual(FakeDatabase.instances, [])
 
     def test_check_reports_corruption_when_engine_returns_false(self):
         FakeDatabase.check_result = False
@@ -339,7 +346,7 @@ class CliTests(unittest.TestCase):
         cases = [
             ("open", "key_count", "Database.key_count() is not available"),
             ("dump", "items", "Database.items() is not available"),
-            ("check", "check", "Database.check() is not available"),
+            ("check", "check_file", "Database.check_file() is not available"),
         ]
         for command, method_name, expected_error in cases:
             with self.subTest(command=command):

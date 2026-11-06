@@ -3,7 +3,7 @@ import os
 import struct
 import threading
 
-from .storage import append_record, read_records
+from .storage import append_record, read_records, verify_records
 from .locking import FileLock
 
 
@@ -61,7 +61,8 @@ class Database:
 
         return struct.pack(">H", len(key)) + key + value
 
-    def _decode_put(self, payload):
+    @staticmethod
+    def _decode_put(payload):
 
         if len(payload) < 2:
             raise ValueError("Invalid PUT payload")
@@ -96,7 +97,8 @@ class Database:
 
         return struct.pack(">H", len(key)) + key
 
-    def _decode_delete(self, payload):
+    @staticmethod
+    def _decode_delete(payload):
 
         if len(payload) < 2:
             raise ValueError("Invalid DELETE payload")
@@ -166,7 +168,8 @@ class Database:
     # BATCH DECODING
     # --------------------------------
 
-    def _decode_batch(self, payload):
+    @staticmethod
+    def _decode_batch(payload):
 
         if len(payload) < 4:
             raise ValueError("Invalid batch payload")
@@ -346,6 +349,63 @@ class Database:
                 self._recover()
 
                 return True
+
+    # --------------------------------
+    # READ-ONLY DATABASE VIEWS
+    # --------------------------------
+
+    def key_count(self):
+
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return len(self.index)
+
+    def items(self):
+
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return list(self.index.items())
+
+    @classmethod
+    def check_file(cls, path):
+        path = os.fspath(path)
+
+        if not os.path.isfile(path):
+            raise FileNotFoundError("Database file does not exist: {}".format(path))
+
+        lock_path = path + ".lock"
+        try:
+            with FileLock(lock_path, create=False):
+                records = verify_records(path)
+                for record_type, payload in records:
+                    if record_type == PUT:
+                        cls._decode_put(payload)
+                    elif record_type == DELETE:
+                        cls._decode_delete(payload)
+                    elif record_type == BATCH:
+                        cls._decode_batch(payload)
+                    else:
+                        raise ValueError("Unknown record type")
+        except FileNotFoundError as error:
+            if error.filename == lock_path:
+                raise RuntimeError(
+                    "Cannot safely verify database without its existing lock file"
+                ) from error
+            raise
+
+        return True
+
+    def check(self):
+
+        with self.lock:
+            self._ensure_open()
+            return type(self).check_file(self.path)
 
     # --------------------------------
     # DELETE
