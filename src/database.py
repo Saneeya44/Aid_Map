@@ -316,6 +316,37 @@ class Database:
                 return self.index.get(key)
 
     # --------------------------------
+    # READ-ONLY DATABASE VIEWS
+    # --------------------------------
+
+    def key_count(self):
+
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return len(self.index)
+
+    def items(self):
+
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return list(self.index.items())
+
+    def check(self):
+
+        with self.lock:
+            self._ensure_open()
+
+            with FileLock(self.lock_path):
+                self._recover()
+                return True
+
+    # --------------------------------
     # DELETE
     # --------------------------------
 
