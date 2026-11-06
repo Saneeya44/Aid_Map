@@ -50,7 +50,17 @@ therefore acknowledges only after those methods return. This describes the
 current implementation and is not, by itself, a claim of crash-safety across
 every filesystem or hardware failure mode.
 
-## V1 torture harness
+### Compaction
+
+Run `python -m src.cli compact PATH` (or use `--db PATH`) to reclaim obsolete
+records and deleted-key tombstones. Compaction holds the same process lock as
+database operations, writes a complete snapshot of live keys to a temporary
+file in the database directory, flushes it, and atomically replaces the
+database. A process killed before replacement leaves the original database
+intact; a process killed after replacement leaves the complete compacted
+snapshot. Unreplaced temporary files are ignored during recovery.
+
+## Torture harness
 
 Run the basic seeded crash test from the repository root:
 
@@ -69,5 +79,18 @@ but OS scheduling means crash timing is not deterministic.
 The verifier requires all ACKed writes and allows the single next in-flight
 request to have committed or not. It reports INCONCLUSIVE rather than assuming
 an outcome when response/history evidence cannot establish a safe serialized
-order. `large-value`, `max-batch`, `recovery-crash`, `compaction-crash`, and
-`disk-full` modes are currently NOT IMPLEMENTED.
+order. Compaction and partial-ENOSPC scenarios are available as seeded modes:
+
+```powershell
+python torture.py --mode compaction-crash --iterations 5 --seed 12345
+python torture.py --mode disk-full --iterations 5 --seed 12345
+```
+
+`compaction-crash` kills a subprocess during snapshot writing or immediately
+before or after atomic replacement, then checks integrity, all live values,
+and size reclamation.
+`disk-full` injects ENOSPC after a partial record write and checks that SERVE
+returns ERR (not ACK) and recovery preserves the prior committed state. This
+simulated mode does not test a configured database size limit or real device
+exhaustion. `large-value`, `max-batch`, and `recovery-crash` remain
+unimplemented harness modes.

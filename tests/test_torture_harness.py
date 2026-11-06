@@ -86,17 +86,19 @@ class TortureHarnessTests(unittest.TestCase):
         self.assertEqual(status, "INCONCLUSIVE")
         self.assertEqual(candidates, [])
 
-    def test_cli_arguments_and_unimplemented_modes(self):
+    def test_cli_arguments_and_implemented_modes(self):
         args = torture.build_parser().parse_args(["--seed", "123"])
         self.assertEqual(args.iterations, 500)
         self.assertEqual(args.seed, 123)
         self.assertEqual(args.mode, "basic")
         self.assertIsNone(args.workdir)
 
-        unsupported = torture.build_parser().parse_args([
-            "--seed", "1", "--mode", "compaction-crash"
-        ])
-        self.assertEqual(unsupported.mode, "compaction-crash")
+        for mode in ("compaction-crash", "disk-full"):
+            with self.subTest(mode=mode):
+                args = torture.build_parser().parse_args([
+                    "--seed", "1", "--mode", mode
+                ])
+                self.assertIn(args.mode, torture.SUPPORTED_MODES)
         with self.assertRaises(SystemExit):
             torture.build_parser().parse_args([])
 
