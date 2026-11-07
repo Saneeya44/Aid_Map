@@ -263,7 +263,12 @@ containing directory after replacement on non-Windows systems; Windows uses
   after replacement it also checks that the file shrank.
 - `disk-full`: fault-injects ENOSPC after a partial record write and checks
   for SERVE `ERR` (not ACK) and preservation of prior committed state.
-- `recovery-crash`: **NOT IMPLEMENTED** as a torture mode.
+- `recovery-crash`: seeds acknowledged PUTs and an atomic batch, appends an
+  incomplete tail, then launches recovery in a child process. The child is
+  force-killed only after it reports pausing inside record replay; a fresh
+  `open`, `check`, and `dump` is then compared with the fsynced ACK oracle.
+  The mode reports INCONCLUSIVE (never PASS) if the replay pause is not
+  observed. It is limited to five iterations.
 
 The oracle is maintained separately from the `.kv` database and fsyncs its
 events. The verifier allows an unACKed operation to have committed or not and
@@ -277,6 +282,7 @@ Example targeted commands:
 ```powershell
 python torture.py --mode compaction-crash --iterations 5 --seed 12345
 python torture.py --mode disk-full --iterations 5 --seed 12345
+python torture.py --mode recovery-crash --iterations 1 --seed 12345
 ```
 
 The disk-full mode simulates a partial-write ENOSPC error; it does not exhaust
