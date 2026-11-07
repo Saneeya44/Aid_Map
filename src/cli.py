@@ -335,6 +335,11 @@ def main(argv=None):
     open_parser.add_argument("operands", nargs="?", metavar="PATH",
                              help="legacy database file path")
     open_parser.add_argument("--db", help="database file path")
+    open_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        help="maximum database file size in bytes",
+    )
 
     dump_parser = commands.add_parser(
         "dump",
@@ -396,7 +401,10 @@ def main(argv=None):
             return 0
 
         open_started = time.perf_counter() if args.command == "open" else None
-        db = Database(path)
+        if args.command == "open" and args.max_bytes is not None:
+            db = Database(path, max_bytes=args.max_bytes)
+        else:
+            db = Database(path)
 
         if args.command == "open":
             open_elapsed_ms = (time.perf_counter() - open_started) * 1000

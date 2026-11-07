@@ -27,13 +27,22 @@ def encode_record(record_type, payload):
     return header + payload
 
 
-def append_record(path, record_type, payload):
+def append_record(path, record_type, payload, max_bytes=None):
     record = encode_record(record_type, payload)
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
     fd = os.open(path, flags, 0o600)
+    original_size = None
+    append_started = False
 
     try:
+        original_size = os.fstat(fd).st_size
+        if max_bytes is not None and original_size + len(record) > max_bytes:
+            raise ValueError(
+                "Database size limit exceeded (max-bytes: {})".format(max_bytes)
+            )
+
+        append_started = True
         remaining = memoryview(record)
 
         while remaining:
@@ -43,6 +52,21 @@ def append_record(path, record_type, payload):
             remaining = remaining[written:]
 
         os.fsync(fd)
+
+    except BaseException as append_error:
+        if not append_started:
+            raise
+
+        try:
+            os.ftruncate(fd, original_size)
+            os.fsync(fd)
+        except OSError as rollback_error:
+            raise OSError(
+                "Append failed ({}); rollback failed ({})".format(
+                    append_error, rollback_error
+                )
+            ) from append_error
+        raise
 
     finally:
         os.close(fd)

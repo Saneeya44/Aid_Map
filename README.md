@@ -130,10 +130,24 @@ python -m src.cli serve PATH
 A batch file contains one operation per nonblank line. PUT values may contain
 spaces after the key:
 
+
+Replace that entire conflict section, including the `<<<<<<<`, `=======`, and `>>>>>>>` markers, with the following:
+
+<WritingBlock id="68324" variant="standard">A batch file contains one operation per nonblank line. PUT values may contain spaces after the key:
+
 ```text
 PUT name Ada Lovelace
 DEL old-name
-```
+The database API accepts `Database(path, max_bytes=N)` (or
+`Database.open(path, max_bytes=N)`) to cap the database file size. The limit
+accounts for complete encoded records, including record headers, and is checked
+under the database's process lock before each write. The CLI `open` command
+accepts `python -m src.cli open PATH --max-bytes N` to open with that limit;
+the setting applies to that database instance and is not stored in the database
+file. Omitting it preserves the existing unlimited behavior.
+
+### SERVE protocol
+>>>>>>> origin/feature/max-bytes
 
 The engine limits keys to 1-1024 bytes, values to at most 1 MiB, and batches
 to at most 10,000 operations. The CLI's text operands are UTF-8; use SERVE for
