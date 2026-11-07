@@ -1,220 +1,189 @@
-# Aid_Map Architecture (source audit)
+# Aid_Map Architecture and Crash Evidence
 
-This describes the implementation currently in this repository against the
-official scenario descriptions supplied in the conversation from Problem
-Statement Section 5, pages 5-8. `OFFICIAL_SCENARIOS.md` was not found in the
-workspace. The document does not claim unsupported behavior is implemented or
-verified. Test names identify repository evidence; tests were not run as part
-of this documentation update.
+This document describes the current implementation in `src/`, the torture
+harness, and the evidence available for each official scenario. A passing
+test or benchmark is evidence for its stated scope only; it is not a blanket
+power-loss guarantee.
 
-## Components and data flow
+## Architecture
 
 ```mermaid
-flowchart TD
-    User[CLI user] --> Cli[src/cli.py]
-    Harness[torture.py] -->|JSON Lines stdin| Serve[src/cli.py serve]
-    Serve --> DB[Database API]
-    Cli --> DB
-    DB --> ThreadLock[threading.RLock]
-    ThreadLock --> FileLock[src/locking.py FileLock]
-    FileLock --> Sidecar[(database.kv.lock)]
-    DB --> Recovery[src/database.py _recover]
-    Recovery --> Reader[src/storage.py read_records]
-    Reader --> Data[(database.kv append-only log)]
-    DB --> Append[src/storage.py append_record]
-    Append --> Data
-    Append --> Fsync[os.fsync]
-    DB --> Index[per-process in-memory dict index]
-    Serve -->|ACK / ERR| Harness
-    Harness --> Oracle[oracle.jsonl; flush + fsync each event]
-    Harness --> Cli
-    Cli --> Check[src/database.py check_file]
-    Check --> Verify[src/storage.py verify_records; read-only data scan]
-    Verify --> Data
+flowchart LR
+    User --> CLI[src/cli.py]
+    Harness[torture.py] -->|JSONL requests| SERVE[src/cli.py]
+    CLI --> DB[src/database.py Database]
+    SERVE --> DB
+    DB -->|thread RLock + process FileLock| Lock[src/locking.py]
+    Lock --> Sidecar[(database.kv.lock)]
+    DB --> Recover[_recover]
+    Recover --> Read[src/storage.py read_records]
+    Read --> Log[(authoritative append-only database file)]
+    DB --> Append[append_record]
+    Append -->|os.write + fsync| Log
+    DB --> Index[per-process dictionary index]
+    DB --> Compact[compact]
+    Compact --> Temp[temporary snapshot in same directory]
+    Temp -->|fsync then os.replace| Log
+    Harness --> Oracle[(separate oracle.jsonl; flush + fsync each event)]
+    Harness -->|open, check, dump| CLI
 ```
 
-`src/locking.py` is the lock implementation. There is no root-level
-`locking.py`. The `torture.py` oracle is separate from the database file.
+### Persisted format
 
-## Files and records on disk
+There is no global database header or separately persisted index. The
+authoritative data is a concatenated stream of records. Each record has a
+14-byte big-endian header (`>4sBBII`):
 
-`Database(path)` creates the database if absent using `open(path, "ab")`, and
-recovery creates/opens a `<path>.lock` sidecar. The database is a concatenated
-record log. There is no global file header, index file, snapshot, compaction
-manifest, or rename-based commit.
-
-Every record has a **14-byte header** (`struct` format `>4sBBII`, big-endian):
-
-| Offset | Size | Meaning |
+| Offset | Bytes | Field |
 |---:|---:|---|
-| 0 | 4 | Magic bytes `KVDB` |
-| 4 | 1 | Format version `1` |
-| 5 | 1 | Record type: `1` PUT, `2` DELETE, `3` BATCH |
-| 6 | 4 | Payload byte length |
-| 10 | 4 | CRC-32 value |
+| 0 | 4 | Magic: `KVDB` |
+| 4 | 1 | Format version: `1` |
+| 5 | 1 | Type: PUT `1`, DELETE `2`, BATCH `3` |
+| 6 | 4 | Payload length |
+| 10 | 4 | CRC-32 over version + type + payload |
 
-The CRC is computed over `version byte + record-type byte + payload`. The magic
-and payload-length header fields are **not** included in that CRC.
+The CRC does not cover the magic or payload-length field.
 
-| Type | Payload layout | Total record size |
+| Type | Payload | Total bytes |
 |---|---|---|
-| PUT (`1`) | 2-byte key length, key bytes, value bytes | `14 + 2 + key length + value length` |
-| DELETE (`2`) | 2-byte key length, key bytes | `14 + 2 + key length` |
-| BATCH (`3`) | 4-byte operation count, followed by encoded operations | `14 + payload length` |
+| PUT | 2-byte key length, key, value (remaining payload) | `14 + 2 + key bytes + value bytes` |
+| DELETE | 2-byte key length, key | `14 + 2 + key bytes` |
+| BATCH | 4-byte operation count, followed by typed operations | `14 + payload bytes` |
 
-Inside a BATCH payload, each operation starts with a 1-byte type and 2-byte
-key length followed by key bytes. A PUT then has a 4-byte value length and
-value bytes; a DELETE has no value fields. Key lengths are 1-1024 bytes,
-values are 0-1 MiB, and the engine accepts at most 10,000 batch operations.
-The SERVE interface requires 1-10,000 batch operations. The underlying
-`Database.batch([])` is a no-op returning `True`.
+Each BATCH member is a 1-byte type and 2-byte key length, followed by key
+bytes. A PUT member additionally has a 4-byte value length and value bytes;
+DELETE has no value fields. Keys are 1-1,024 bytes, values 0-1 MiB, and
+batches contain at most 10,000 operations. A batch is one record, and members
+apply in supplied order; the last operation on a repeated key determines its
+final presence/value.
 
-The lock sidecar is opened in append/read-write mode for normal use. If it is
-empty, `FileLock` writes one zero byte before locking. Windows locks byte zero
-with `msvcrt.locking`; POSIX uses `fcntl.flock`. Strict CHECK opens an existing
-sidecar without creating it. Initializing that byte flushes the Python file
-object but does not call `os.fsync` on the sidecar.
+The `.lock` sidecar is synchronization metadata, not a second data store.
+Compaction temporarily creates a snapshot file in the same directory, then
+replaces the authoritative path. During compaction the old database remains
+authoritative until replacement; after replacement the new file is
+authoritative.
 
-## Write, fsync, commit, and ACK ordering
+### Write, ACK, and batch ordering
 
-### Database initialization
+For a non-empty successful write:
 
-1. `Database.__init__` opens the data file in append-binary mode, creating an
-   empty one if missing.
-2. It acquires its process-local `RLock`, then the process `FileLock`.
-3. `_recover()` reads/replays records. An incomplete final record may be
-   truncated and fsynced here.
-4. Initialization releases locks and returns. There is no directory fsync
-   after creating the data or lock file.
+1. Encode and validate the operation.
+2. Acquire the instance `threading.RLock`, then the sidecar `FileLock`.
+3. Replay the current file to refresh the in-memory index.
+4. Encode one record and append with `O_APPEND`, looping over `os.write`.
+5. Call `os.fsync` on the database file.
+6. Update the in-memory index and return from the database method.
+7. Release locks; for SERVE, write and flush `ACK <id>\n`.
 
-### PUT
+DELETE of an absent key returns false without appending; SERVE ACKs a
+successful method return, including that no-op. A BATCH is validated and
+encoded before locking, appended as one record, fsynced once, and only then
+applied to the in-memory index. Recovery either reads and applies the complete
+valid record or truncates an incomplete final record as a whole.
 
-1. `Database.put` encodes and validates the key/value before locking.
-2. It acquires the `RLock` and process lock, then `_recover()` refreshes the
-   process-local index from the file.
-3. `append_record` creates the full encoded record in memory, opens with
-   `O_APPEND`, loops over `os.write` until all bytes are written, and calls
-   `os.fsync(fd)`.
-4. Only after `append_record` returns does `Database.put` update its index and
-   return; the process lock and `RLock` are then released.
-5. SERVE writes `ACK <id>\n` and flushes stdout only after the method returns.
+There is **no separate batch commit-marker record**. A complete CRC-valid
+BATCH can be replayed even if the process died before the caller observed an
+ACK. This is compatible with whole-record all-or-none replay, but it does not
+implement a specification requiring “all bytes before a later commit marker
+remain invisible.”
 
-DELETE follows the same persistence sequence only when the key is present. If
-absent, `Database.delete` returns `False` without appending; SERVE currently
-ACKs either successful return value.
+### Locking, recovery, size limits, and compaction
 
-### BATCH
+- Each `Database` instance serializes threads with `threading.RLock`.
+  Operations also use `FileLock` on `<database path>.lock`: Windows uses
+  `msvcrt.locking`, POSIX uses `fcntl.flock`.
+- The in-memory dictionary is rebuilt from the record log on open and
+  refreshed while locked on subsequent operations.
+- `read_records()` truncates an incomplete trailing header or payload to that
+  record's starting offset, flushes, and fsyncs. Invalid magic/version,
+  checksum, or decoded operation raises; it is not silently discarded.
+- `check` uses `Database.check_file()` and `verify_records()` for a strict,
+  non-repairing scan. It requires the existing lock sidecar. `open`, ordinary
+  API reads, and `dump` construct a `Database` and can therefore repair a
+  torn tail during recovery.
+- `max_bytes` is an instance option on `Database` (the CLI exposes it on the
+  `open` command only). Appends compare current size plus full record size
+  under the process lock before writing. If an OS write fails after a partial
+  append, storage attempts `ftruncate` to the old size and fsyncs the rollback.
+  If rollback also fails, the raised error reports both failures. The cap is
+  not stored in the file and must be passed again to every new instance.
+- `compact()` takes the same locks, replays the log, writes live PUT snapshots
+  to a temporary file in the database directory, flushes/fsyncs it, then calls
+  `os.replace`. On non-Windows systems it fsyncs the containing directory
+  after replacement. Windows has no directory-fsync step here. The configured
+  `max_bytes` cap is not applied to the temporary compaction snapshot; ENOSPC
+  before replacement leaves the old database path in place. Orphan temp-file
+  cleanup is best effort, not a complete startup scavenger.
 
-1. The engine encodes/validates the full operation list before locking.
-2. It acquires both locks and refreshes the index with `_recover()`.
-3. It appends **one** BATCH record, writes all record bytes, then fsyncs once.
-4. Only after append/fsync returns does the engine decode the batch payload and
-   apply its operations to the in-memory index; it returns `True`.
-5. SERVE emits one ACK after that return.
+## Official A1-F4 scenario evidence matrix
 
-There is no `rename`, `os.replace`, temp database, or second commit file in
-these paths. ACK follows the method's fsync call, but the code does not fsync
-the containing directory when files are created and cannot promise behavior of
-every filesystem, controller, or hardware cache.
+“Verified” means the current suite, mode, or supplied recorded measurement
+exercised the stated condition. “Partially verified” means related behavior
+or source ordering is covered but a specific official crash point or
+acceptance condition is not. “Unverified” means no adequate matching
+demonstration exists. The performance measurements below are team-reported;
+raw console logs are not checked into the repository.
 
-## Locking, index, recovery, CHECK, and missing features
-
-- Each `Database` instance has a `threading.RLock`; operations also acquire a
-  sidecar process lock. Reads, writes, key count, and items all call `_recover`
-  while locked, rebuilding the index from the log.
-- `_recover()` uses `read_records()` in `src/storage.py`. Incomplete trailing
-  header or payload: truncate to the beginning of that record, flush and
-  fsync, then stop replaying. Bad magic/version/checksum raises instead of
-  truncating that record.
-- `Database.check_file()` requires an existing database and lock file, holds
-  the existing lock, calls `verify_records()` (read-only database open), and
-  validates record payloads. It does not construct a `Database`, create a
-  missing database, or repair the database tail.
-- The in-memory index is a Python dictionary, not persisted independently.
-- No compaction, snapshotting, `--max-bytes`, bounded disk allocator, or
-  database-level disk-full prevention mechanism was found.
-
-## Official 32-scenario crash matrix
-
-The official expected outcomes are reproduced in the second column. “Current
-disk state/recovery” describes what the present code would store or do, not a
-test result. `NOT VERIFIED` means this exact acceptance criterion was not
-established (a referenced test may cover only a related case and was not run
-in this documentation update). `NOT IMPLEMENTED` means the needed mechanism
-is absent or current behavior conflicts with the requirement.
-
-| ID | Official scenario and expected after restart | Actual disk state / recovery mechanism | Code location | Test evidence and assessment |
-|---|---|---|---|---|
-| A1 | Kill before any bytes of a put reach the file. Key absent or previous value. | Before append starts, file remains the prior valid log; recovery replays it unchanged. | `src/database.py:Database.put`; `src/storage.py:append_record`, `read_records` | No test kills before first record byte. **NOT VERIFIED**. |
-| A2 | Kill after some bytes of the record are written, but not all. Torn bytes ignored; key absent or previous value. | A short trailing header or payload is truncated to the start of that record and fsynced; prior records replay. | `src/storage.py:_read_records`; `src/database.py:Database._recover` | `tests/test_torture_scenarios.py::test_force_kill_during_partial_put_recovers_previous_value` pauses after a partial `os.write` and force-kills. Test present; not rerun here. **NOT VERIFIED for this update**. |
-| A3 | Kill after record fully written, before fsync. Either old or new state; no corruption. | A complete CRC-valid record may be observed and replayed, or may not persist. There is no recovery commit-marker check beyond record completeness/checksum. | `src/storage.py:append_record`, `_read_records`; `src/database.py:Database._recover` | No deterministic full-write/pre-fsync crash hook/test. **NOT VERIFIED**. |
-| A4 | Kill after fsync returns, before put returns success. New value present. | Complete record has passed file `os.fsync`; fresh recovery replays it even if memory update/method return did not occur. | `src/storage.py:append_record`; `src/database.py:Database.put` | Ordering is in source; no test hook kills specifically between fsync return and method return. **NOT VERIFIED**. |
-| A5 | Kill immediately after put returns success. New value present. | PUT record has been written and `os.fsync` returned before method success; startup replays it. | `src/database.py:Database.put`; `src/storage.py:append_record` | `tests/test_torture_scenarios.py::test_force_kill_immediately_after_put_ack_preserves_value`; `tests/test_serve.py::test_put_ack_is_durable_and_value_survives_restart`. Test present; not rerun here. **NOT VERIFIED for this update**. |
-| A6 | Kill during delete. Old value present or key absent; never corrupted. | A partial DELETE tail is truncated, leaving old value; a complete valid DELETE is replayed, leaving key absent. | `src/database.py:Database.delete`; `src/storage.py:append_record`, `_read_records` | No deterministic kill during DELETE record write. **NOT VERIFIED**. |
-| A7 | Kill during a 1 MB put. Same guarantees as A1-A5. | Same PUT record path; incomplete trailing record is truncated, complete valid record is replayed. | `src/database.py:Database.put`; `src/storage.py:append_record`, `_read_records` | `tests/test_torture_scenarios.py::test_maximum_one_mib_value_survives_restart` tests size/reopen, not crash timing; harness unit tests cover case generation. **NOT VERIFIED for crash guarantees**. |
-| B1 | Kill after 3 of 10 operations are written. None of the 10 visible. | Operations are encoded as one BATCH record, not individually appended. A partial record is truncated as a whole; no member is replayed. | `src/database.py:Database.batch`, `_encode_batch`; `src/storage.py:_read_records` | `tests/test_torture_scenarios.py::test_force_kill_during_partial_batch_keeps_entire_old_state` kills during a partial two-operation batch. Test present; not rerun here and does not target 3 of 10. **NOT VERIFIED for exact point**. |
-| B2 | Kill after all 10 are written but before commit marker. None visible. | **No separate commit marker exists.** A complete BATCH record is checksum-validated and replayed; thus a fully written record can become visible before any separate marker. Current format does not implement the stated marker protocol. | `src/storage.py:encode_record`, `_read_records`; `src/database.py:Database._recover` | No commit marker or corresponding test. **NOT IMPLEMENTED**. |
-| B3 | Kill after commit marker, before fsync. All or none. | There is no separate marker. One complete BATCH record is replayed wholly; an incomplete one is truncated wholly. A completed unsynced record may be visible after process kill. | `src/database.py:Database.batch`; `src/storage.py:append_record`, `_read_records` | Partial-batch test covers truncation of one record, but no marker-to-fsync crash hook. **NOT VERIFIED for exact point**. |
-| B4 | Kill after batch returns success. All visible. | Successful `batch` appends one record and fsyncs before applying members and returning; recovery replays the record. | `src/database.py:Database.batch`, `_recover`; `src/storage.py:append_record` | `tests/test_serve.py::test_batch_is_one_call_and_emits_one_ack`; `tests/test_torture_scenarios.py::test_engine_accepts_10000_batch_operations_and_rejects_10001` reopens accepted batch. **NOT VERIFIED for forced kill after batch ACK**. |
-| B5 | Batch puts and deletes the same key. Ordering defined in README and honored. | `_apply_operations` applies operations sequentially in supplied order; later operations determine the final value/presence. README does not currently define this same-key conflict rule. | `src/database.py:_apply_operations`, `_decode_batch`; `src/cli.py:read_batch_operations` | No focused batch same-key ordering test found; README does not define the rule. **NOT VERIFIED**. |
-| B6 | Kill halfway through a 10,000-operation batch. None visible; recovery under 2 seconds. | One BATCH record means partial trailing data is discarded as a unit. No evidence establishes replay under 2 seconds at this size. | `src/database.py:Database.batch`, `_recover`; `src/storage.py:_read_records` | `tests/test_torture_scenarios.py::test_engine_accepts_10000_batch_operations_and_rejects_10001` checks limit/ordinary reopen; no kill-mid-10,000 test or timed recovery threshold. **NOT VERIFIED**. |
-| C1 | Kill during log replay in open(). Next open succeeds with correct state. | `_recover` rebuilds index by scanning valid records; process death does not persist its in-memory partial index, so next open scans again. | `src/database.py:Database.__init__`, `_recover`; `src/storage.py:read_records` | `tests/test_torture_scenarios.py::test_kill_during_recovery_leaves_recoverable_database` pauses after record scanning, before `_recover` applies scanned records; then reopens. **NOT VERIFIED for mid-replay interruption**. |
-| C2 | Kill during torn-tail repair. Next open succeeds. | Repair truncates to trailing record start, flushes, then fsyncs. A second interruption within truncate/fsync is not shown idempotent by a test. | `src/storage.py:_read_records`; `src/database.py:Database._recover` | `tests/test_check_readonly.py::test_normal_recovery_still_repairs_incomplete_tail` completes repair normally; no kill during repair. **NOT VERIFIED**. |
-| C3 | Kill during compaction before replacement. Old file remains authoritative. | Compaction/replacement is not implemented; no compaction file state exists. | No compaction function in `src/` | No test. **NOT IMPLEMENTED**. |
-| C4 | Kill during compaction rename/swap. Exactly one complete state authoritative. | No rename/swap or compaction implementation. | No compaction function in `src/` | No test. **NOT IMPLEMENTED**. |
-| C5 | Kill after swap before cleanup. Data intact; temporary files cleaned or ignored. | No swap or temporary compaction files are created by the engine. | No compaction function in `src/` | No test. **NOT IMPLEMENTED**. |
-| C6 | Kill during close(). Same guarantees as any other kill. | `Database.close()` only sets `closed = True`; it does not flush, append, rename, or perform cleanup. Previously completed writes rely on their earlier fsync calls. | `src/database.py:Database.close`; `src/storage.py:append_record` | No kill-during-close test. **NOT VERIFIED**. |
-| D1 | Two writers put different keys, then kill. All ACKed puts survive. | Each write holds the sidecar process lock, refreshes the log, appends/fsyncs, then returns; recovery replays both complete records. | `src/database.py:Database.put`; `src/locking.py:FileLock` | `tests/test_cross_process_consistency.py::test_open_handles_see_sequential_commits_after_forced_kill` covers two processes, ACKed writes, force-kill, fresh reopen. Test present; not rerun here. **NOT VERIFIED for this update**. |
-| D2 | Two writers put the same key, then kill. Value is one complete value actually written. | Sidecar lock serializes complete append records; the later serialized PUT is final, never a bytewise blend in a valid record. | `src/database.py:Database.put`; `src/locking.py:FileLock`; `src/storage.py:append_record` | `tests/test_cross_process_consistency.py::test_barrier_concurrent_writes_and_same_key_serialized_order` checks both values/consistent result after force-kill and restart. Test present; not rerun here. **NOT VERIFIED for this update**. |
-| D3 | Long batch concurrent with individual puts, then kill. Batch atomic; ACKed individual puts survive. | The same process lock serializes batch and individual writes; batch is one record, individual PUTs are separate records. | `src/database.py:Database.batch`, `put`; `src/locking.py:FileLock` | No focused concurrent long-batch/individual-PUT crash test found. **NOT VERIFIED**. |
-| D4 | GET during batch. Reader sees before or after, never partial. | GET acquires the same sidecar lock and replays complete records; it cannot interleave with a batch append through these APIs. | `src/database.py:Database.get`, `batch`; `src/locking.py:FileLock` | No focused concurrent GET-during-batch test found. **NOT VERIFIED**. |
-| E1 | File cap reached during PUT. Clean error; old data readable. | No configurable file cap. An append `OSError` propagates; SERVE converts it to ERR, but no cap logic/rollback is provided. | `src/storage.py:append_record`; `src/cli.py:serve`; no max-size mechanism | `tests/test_torture_scenarios.py::test_disk_full_fault_injection_returns_error_without_ack` injects failure before actual append and tests no new key; not cap/partial-write/old-data coverage. **NOT IMPLEMENTED**. |
-| E2 | File cap reached halfway through batch. Error; none visible. | No configurable cap. If an append ends with an incomplete BATCH tail, recovery truncates the whole record; complete record may be present despite an unACKed error. | `src/database.py:Database.batch`; `src/storage.py:append_record`, `_read_records` | No partial-write batch ENOSPC test or cap. **NOT IMPLEMENTED**. |
-| E3 | Kill after file cap reached. Previously ACKed data survives. | No cap mechanism. Ordinary ACK ordering fsyncs each completed record, but no capped-file scenario is supported. | `src/database.py:Database.put`, `batch`; `src/storage.py:append_record` | ACK/reopen tests exist for ordinary writes; none with configured cap. **NOT IMPLEMENTED**. |
-| E4 | File cap reached during compaction. No data loss; database opens. | Neither cap nor compaction exists. | No size-cap or compaction code in `src/` | No test. **NOT IMPLEMENTED**. |
-| E5 | Deletes and compaction free space. New writes succeed without manual intervention. | DELETE appends a tombstone; it does not shrink the log. No compaction reclaims bytes or releases file space. | `src/database.py:Database.delete`; `src/storage.py:append_record` | `tests/test_torture_scenarios.py::test_deleting_nonexistent_key_returns_false_without_log_write` only checks absent-key no-op; no reclaim test. **NOT IMPLEMENTED**. |
-| F1 | 500 random kills and restarts. Invariant holds every time. | Basic harness loops isolated runs, force-kills SERVE, reopens and verifies using its independent oracle. Scheduling and kill window vary. | `torture.py:run_basic`, `IterationRunner.run`; `verify_oracle_log` | Harness tests in `tests/test_torture_harness.py`; prior smoke runs are not a recorded 500-iteration result. **NOT VERIFIED for 500 iterations**. |
-| F2 | Repeated kills during recovery. Recovery remains idempotent. | Recovery repairs incomplete tail via truncate/flush/fsync and replays valid records; repeated interruption specifically inside repair is unproven. | `src/database.py:Database._recover`; `src/storage.py:_read_records` | One interruption test: `tests/test_torture_scenarios.py::test_kill_during_recovery_leaves_recoverable_database`; no repeated-kill sequence. **NOT VERIFIED**. |
-| F3 | 1,000,000 keys, kill, reopen. Recovery under 2 seconds; ACKed keys present. | Index is rebuilt by linear log replay into a Python dict. No snapshot or indexed recovery shortcut; no million-key performance evidence. | `src/database.py:Database._recover`, `put`; `src/storage.py:read_records` | No 1,000,000-key test/benchmark. **NOT VERIFIED**. |
-| F4 | Truncate database by one byte manually. Open succeeds; at most last unACKed record lost. | Short final payload is truncated back to the start of its entire record, which may discard the most recent record even if it was previously ACKed. | `src/storage.py:_read_records`; `src/database.py:Database._recover` | `tests/test_check_readonly.py::test_normal_recovery_still_repairs_incomplete_tail` tests appended `b"KV"` after a valid record, not truncation of an ACKed last record. **NOT IMPLEMENTED**. |
+| ID | Official scenario and expected after restart | Disk state, recovery, and code | Test evidence and status |
+|---|---|---|---|
+| A1 | Kill before any bytes of a put reach the file. Key absent or previous value. | No new record bytes; prior log replays. `Database.put`, `append_record`. | No kill-at-zero-byte test. **UNVERIFIED**. |
+| A2 | Kill after some bytes of the record are written, but not all. Torn bytes ignored; key absent or previous value. | Incomplete tail is truncated to record start and fsynced. `append_record`, `_read_records`. | `test_force_kill_during_partial_put_recovers_previous_value`. **VERIFIED**. |
+| A3 | Kill after record fully written, before fsync. Either old or new state; no corruption. | Complete valid record may be replayed; partial/invalid tail is rejected/repaired. No durability claim before fsync. | No deterministic full-write/pre-fsync kill. **UNVERIFIED**. |
+| A4 | Kill after fsync returns, before put returns success. New value present. | File fsync precedes index update and method return; recovery replays the record. `append_record`, `Database.put`. | Ordering is established by source, not a kill hook at this exact boundary. **PARTIALLY VERIFIED**. |
+| A5 | Kill immediately after put returns success. New value present. | Successful PUT has passed file fsync before return; replay restores it. | `test_force_kill_immediately_after_put_ack_preserves_value`; `test_put_ack_is_durable_and_value_survives_restart`. **VERIFIED**. |
+| A6 | Kill during delete. Old value present or key absent; never corrupted. | A short tail is removed as one DELETE record; a complete valid DELETE is replayed. `Database.delete`, `read_records`. | No deterministic kill during DELETE append. **PARTIALLY VERIFIED**. |
+| A7 | Kill during a 1 MB put. Same guarantees as A1–A5. | Same PUT record path; incomplete record is discarded as a whole. | 1 MiB restart test and `large-value` generation cover size/ordinary recovery, not every A1-A5 kill boundary. **PARTIALLY VERIFIED**. |
+| B1 | Kill after 3 of 10 operations are written. None of the 10 visible. | All ten members are bytes of one BATCH record; incomplete tail is truncated whole. `Database.batch`, `_read_records`. | Partial two-operation batch kill test, not exactly 3/10. **PARTIALLY VERIFIED**. |
+| B2 | Kill after all 10 are written but before commit marker. None visible. | There is no separate commit marker. A full valid BATCH record is replayed, so the required marker boundary is not represented. | Protocol mismatch; no marker test. **UNVERIFIED / REQUIREMENT GAP**. |
+| B3 | Kill after commit marker, before fsync. All or none. | There is no separate marker; one complete record is replayed whole, incomplete record is discarded whole. | Partial batch kill coverage exists; no marker-to-fsync kill. **PARTIALLY VERIFIED**. |
+| B4 | Kill after batch returns success. All visible. | BATCH is fsynced before in-memory apply/return; replay applies all members. | Batch API/ACK tests and 10,000-op ordinary reopen test; no exact post-return forced-kill hook. **PARTIALLY VERIFIED**. |
+| B5 | Batch puts and deletes the same key. Ordering is defined in README and honored. | Members are applied sequentially; README now documents last-operation-wins. `Database._apply_operations`, `read_batch_operations`. | Code path is clear; no focused same-key order test. **PARTIALLY VERIFIED**. |
+| B6 | Kill halfway through a 10,000-operation batch. None visible; recovery under 2 seconds. | One BATCH record means a torn record is discarded whole. | Exact 10,000-op/10,001 rejection tests and mode generation exist; no timed mid-write kill run at 10,000 ops. **PARTIALLY VERIFIED**. |
+| C1 | Kill during log replay in open(). Next open succeeds with correct state. | Replay rebuilds only an in-memory index; next open replays from the file again. `Database._recover`. | Current validation: seed `12345`, 3/3 recovery-crash iterations passed in 1.64 s; each pause/kill and subsequent open/CHECK/DUMP/oracle verification was confirmed. No standalone log file is checked in. **VERIFIED**. |
+| C2 | Kill during torn-tail repair. Next open succeeds. | Truncate, flush, fsync are retried by a subsequent open if interrupted. `_read_records`. | Normal tail repair is tested; no kill at truncate/fsync sub-boundary. **PARTIALLY VERIFIED**. |
+| C3 | Kill during compaction before replacement. Old file remains authoritative. | Snapshot is written to a same-directory temp; old path is not replaced until `os.replace`. | `test_kill_before_compaction_replace_keeps_original_database`; snapshot-write pause test. **VERIFIED**. |
+| C4 | Kill during compaction rename/swap. Exactly one complete state is authoritative. | Replacement uses `os.replace`; directory fsync follows only on non-Windows. | Before- and after-replacement tests exist, but no kill inside the replacement syscall and Windows power-loss semantics are unproven. **PARTIALLY VERIFIED**. |
+| C5 | Kill after swap before cleanup. Data intact; temporary files cleaned or ignored. | After replace, target is the complete snapshot; the old temp name has moved. Recovery reads only target. | After-replacement kill test verifies data; generic orphan cleanup is not promised. **PARTIALLY VERIFIED**. |
+| C6 | Kill during close(). Same guarantees as any other kill. | `Database.close()` only marks the instance closed; prior completed appends already fsynced. | No kill-during-close test. **PARTIALLY VERIFIED**. |
+| D1 | Two writers put different keys, then kill. All ACKed puts survive. | File lock serializes appends and each ACK follows fsync. | `test_open_handles_see_sequential_commits_after_forced_kill`. **VERIFIED**. |
+| D2 | Two writers put the same key, then kill. Value is one complete value actually written. | Lock serializes whole records; a valid PUT is not bytewise merged with another. | `test_barrier_concurrent_writes_and_same_key_serialized_order`. **VERIFIED**. |
+| D3 | Long batch concurrent with individual puts, then kill. Batch atomic; ACKed individual puts survive. | Same process lock serializes each one-record batch and PUT. | Separate concurrency and atomic-batch tests cover parts, not the combined long-batch kill. **PARTIALLY VERIFIED**. |
+| D4 | GET during batch. Reader sees before or after, never partial. | GET acquires the sidecar lock and replays complete records. | No focused overlapping GET/large-batch test. **PARTIALLY VERIFIED**. |
+| E1 | File cap reached during PUT. Clean error; old data readable. | Full encoded size is checked before write; partial OS failures attempt rollback. | `test_put_exceeding_limit_fails_without_losing_existing_data`; ENOSPC rollback tests. **VERIFIED** for configured cap and injected errors. |
+| E2 | File cap reached halfway through batch. Error; none visible. | Size limit rejects the whole record; partial ENOSPC rolls the file back to its starting size. | `test_batch_exceeding_limit_is_rejected_atomically`; `test_failed_batch_enospc_is_absent_after_reopen`. **VERIFIED** for limit/fault-injection behavior. |
+| E3 | Kill after file cap reached. Previously ACKed data survives. | Failed append does not ACK; earlier ACKed records were fsynced. | Limit/ACK error tests cover preservation, but not a kill after the cap error. **PARTIALLY VERIFIED**. |
+| E4 | File cap reached during compaction. No data loss; database opens. | Snapshot writes to a temp and replaces only on success; cap is not applied to compaction. ENOSPC before replace should preserve old path. | Compaction fsync/replace failure tests preserve old data; no explicit cap/ENOSPC compaction test. **PARTIALLY VERIFIED**. |
+| E5 | Deletes and compaction free space. New writes succeed without manual intervention. | Compaction emits only live PUT records; an empty live set becomes an empty log. | Churn benchmark reports 1M PUT + 1M DELETE, 51,003,600 → 0 bytes, reopen passed; no post-compaction write in that run. **PARTIALLY VERIFIED**. |
+| F1 | 500 random kills and restarts. Invariant holds every time. | Basic harness uses two writers, forced process kill, and independent fsynced oracle verification. | Reported run: seed `67890`, 500 PASS, 0 FAIL/INCONCLUSIVE/ERROR, 194.24 seconds. **VERIFIED** (reported result; transcript not checked in). |
+| F2 | Repeated kills during recovery. Recovery remains idempotent. | Next open rebuilds from the same authoritative file; tail repair is truncate+fsync. | `recovery-crash` repeats one replay kill per isolated iteration; no repeated kill sequence on the same recovery/database. **PARTIALLY VERIFIED**. |
+| F3 | 1,000,000 keys, kill, reopen. Recovery under 2 seconds; ACKed keys present. | Linear record replay rebuilds the dict. | Million-key reopen benchmark: 0.809168 s, 1,000,000 keys and samples correct; benchmark is a clean reopen, not kill during loading. **PARTIALLY VERIFIED**. |
+| F4 | Truncate database by one byte manually. Open succeeds; at most last unACKed record lost. | Short tail is discarded to the beginning of its record; if that was an ACKed final record, it can also be lost. | Normal incomplete-tail append repair test exists, not this exact truncation. **UNVERIFIED; possible acceptance conflict**. |
 
 ## Guarantee arguments and limits
 
-### Durability
+**Durability:** An ACK from SERVE follows the database method return; a
+successful non-empty append calls file `os.fsync` before that return. The
+code-path ordering supports ACK durability under the tested process-kill
+model. It does not prove storage-controller behavior during power loss, and
+new file/directory entries are not directory-fsynced on creation.
 
-For a successful non-empty PUT, present-key DELETE, or BATCH, the implementation
-calls `os.fsync` on the database file before the method returns; SERVE sends
-ACK after method return. This is a code-path argument, not proof of persistence
-across all power-loss, filesystem, or hardware-cache failures. File/directory
-creation is not followed by directory fsync. A failed operation without ACK
-may nevertheless have left a complete record on disk.
+**Batch atomicity:** A BATCH is one checksummed log record and the index applies
+its members only after append/fsync. Recovery discards an incomplete record
+whole. This is the implemented all-or-none basis; no separate commit marker
+exists, and arbitrary corruption or rollback failure is outside the proof.
 
-### Batch atomicity
+**Recoverability:** Open replays complete records and truncates an incomplete
+tail; the new recovery-crash mode confirms a kill during record replay followed
+by successful re-open and oracle verification. Invalid headers/checksums are
+errors, not auto-repaired. Strict CHECK is read-only and intentionally does
+not repair.
 
-A batch is represented by one BATCH log record. Recovery only applies complete,
-checksum-valid records, so an incomplete trailing record is truncated as a
-whole. The engine applies batch members after the complete append/fsync. This
-supports all-or-none recovery for torn tail records under the implemented
-format. It is not a proof against arbitrary corruption or bugs, and final-state
-tests cannot detect every partially applied batch later masked by subsequent
-operations.
+## Remaining high-risk gaps
 
-### Recoverability
-
-Startup replays the log and repairs only an incomplete trailing header or
-payload. Strict CHECK instead rejects incomplete tails without repairing the
-database. Invalid magic/version, checksum mismatch, or invalid operation
-payload raises; no automated salvage of committed corruption is implemented.
-The length field is not covered by the CRC, so a corrupted length may produce
-an error or an incomplete-tail interpretation; no format change was made.
-
-## Source/test references
-
-Primary files: `src/database.py`, `src/storage.py`, `src/locking.py`,
-`src/cli.py`, and `torture.py`.
-
-Relevant tests present in `tests/`: `test_atomic_batch.py`,
-`test_check_readonly.py`, `test_recovery.py`, `test_locking.py`,
-`test_multiprocessing.py`, `test_serve.py`, `test_torture_harness.py`, and
-`test_torture_scenarios.py`. Their presence is not a test result; consult the
-checklist for validation status.
+- No deterministic evidence for A1, A3, A4, A6, C2, C6, or D4 exact crash or
+  overlap boundaries; F4 may conflict with the ACK-retention requirement.
+- B2's separate commit-marker expectation is not implemented.
+- `os.replace` plus directory fsync has a platform-specific durability gap on
+  Windows; process-kill tests do not emulate sudden power loss.
+- The raw benchmark console transcripts and original prompts from all
+  teammates are not currently in the repository.

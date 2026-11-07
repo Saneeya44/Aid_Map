@@ -2,6 +2,7 @@ import argparse
 import base64
 import json
 import os
+import queue
 import random
 import re
 import subprocess
@@ -25,6 +26,7 @@ SUPPORTED_MODES = (
     "basic",
     "large-value",
     "max-batch",
+    "recovery-crash",
     "compaction-crash",
     "disk-full",
 )
@@ -36,6 +38,10 @@ MAX_BATCH_OPERATIONS = 10000
 
 
 class HarnessError(Exception):
+    pass
+
+
+class RecoveryNotTriggered(HarnessError):
     pass
 
 
@@ -56,7 +62,8 @@ def build_parser():
             "Examples:\n"
             "  python torture.py --iterations 500 --seed 12345 --mode basic\n"
             "  python torture.py --iterations 1 --seed 12345 --mode large-value\n"
-            "  python torture.py --iterations 1 --seed 12345 --mode max-batch"
+            "  python torture.py --iterations 1 --seed 12345 --mode max-batch\n"
+            "  python torture.py --iterations 1 --seed 12345 --mode recovery-crash"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -76,7 +83,10 @@ def build_parser():
         "--mode",
         choices=KNOWN_MODES,
         default="basic",
-        help="basic, maximum-value, or maximum-batch test (default: basic)",
+        help=(
+            "basic, large-value, max-batch, recovery-crash, compaction-crash, "
+            "or disk-full (default: basic)"
+        ),
     )
     parser.add_argument(
         "--workdir",
@@ -1611,6 +1621,348 @@ def _scenario_root(workdir):
     return None, tempfile.mkdtemp(prefix="aid-map-torture-", dir=parent)
 
 
+def _record_recovery_ack(oracle, database, expected, sequence, request):
+    operation_id = request["id"]
+    oracle.record({
+        "event": "request",
+        "sequence": sequence,
+        "request": request,
+    })
+    oracle.record({
+        "event": "sent",
+        "sequence": sequence,
+        "id": operation_id,
+    })
+
+    def decode(value):
+        return base64.b64decode(value.encode("ascii"), validate=True)
+
+    if request["op"] == "put":
+        database.put(decode(request["key"]), decode(request["value"]))
+    elif request["op"] == "delete":
+        database.delete(decode(request["key"]))
+    elif request["op"] == "batch":
+        operations = []
+        for item in request["operations"]:
+            key = decode(item["key"])
+            if item["op"] == "put":
+                operations.append(("put", key, decode(item["value"])))
+            else:
+                operations.append(("delete", key))
+        database.batch(operations)
+    else:
+        raise HarnessError("Unsupported recovery-crash operation")
+
+    oracle.record({
+        "event": "response",
+        "id": operation_id,
+        "response": "ACK",
+        "reason": "",
+    })
+    apply_request(expected, request)
+
+
+def _kill_during_recovery_replay(database_path, target_put):
+    code = r"""
+import sys
+from src.database import Database
+
+target = int(sys.argv[2])
+original_decode_put = Database._decode_put
+seen = 0
+
+def pause_during_replay(payload):
+    global seen
+    seen += 1
+    if seen == target:
+        print("RECOVERY_REPLAY_PAUSED {}".format(seen), flush=True)
+        sys.stdin.readline()
+    return original_decode_put(payload)
+
+Database._decode_put = staticmethod(pause_during_replay)
+database = Database(sys.argv[1])
+database.close()
+print("RECOVERY_FINISHED", flush=True)
+"""
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", code, str(database_path), str(target_put)],
+            cwd=str(ROOT),
+            env=_environment(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as error:
+        raise HarnessError("Could not start recovery child: {}".format(error)) from error
+
+    lines = queue.Queue()
+
+    def read_output():
+        try:
+            for line in process.stdout:
+                lines.put(line.rstrip("\r\n"))
+        except (OSError, ValueError):
+            pass
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=read_output, name="recovery-output-reader")
+    reader.daemon = True
+    reader.start()
+    confirmed = False
+    reason = "recovery did not reach the replay pause"
+    kill_delay_ms = None
+    try:
+        deadline = time.monotonic() + PROCESS_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if line is None:
+                reason = "recovery child exited before the replay pause"
+                break
+            if line == "RECOVERY_REPLAY_PAUSED {}".format(target_put):
+                pause_seen_at = time.monotonic()
+                confirmed = True
+                process.kill()
+                try:
+                    process.wait(timeout=PROCESS_TIMEOUT)
+                except subprocess.TimeoutExpired as error:
+                    raise HarnessError(
+                        "Could not terminate recovery child after replay pause"
+                    ) from error
+                kill_delay_ms = int((time.monotonic() - pause_seen_at) * 1000)
+                if process.returncode == 0:
+                    confirmed = False
+                    reason = "recovery child exited normally instead of being killed"
+                else:
+                    reason = "force-killed while applying a recovered PUT record"
+                break
+            reason = "recovery child output before pause: {}".format(line[:160])
+        if not confirmed and process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=PROCESS_TIMEOUT)
+            except subprocess.TimeoutExpired as error:
+                raise HarnessError("Recovery child did not stop") from error
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=PROCESS_TIMEOUT)
+        reader.join(timeout=READER_TIMEOUT)
+        if reader.is_alive():
+            raise HarnessError("Recovery output reader did not stop")
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    return confirmed, kill_delay_ms, reason
+
+
+def _prepare_recovery_crash_database(database_path, oracle_path, generator):
+    from src.database import Database
+
+    with open(database_path, "wb"):
+        pass
+    expected = {}
+    oracle = OracleLog(oracle_path)
+    put_count = 0
+    try:
+        with Database(database_path) as database:
+            sequence = 0
+            for index in range(16):
+                request = {
+                    "id": "recovery-{:04d}".format(sequence),
+                    "op": "put",
+                    "key": _b64("recovery-key-{:02d}".format(index).encode("ascii")),
+                    "value": _b64(random_value(generator)),
+                }
+                _record_recovery_ack(
+                    oracle, database, expected, sequence, request
+                )
+                sequence += 1
+                put_count += 1
+
+            batch = {
+                "id": "recovery-{:04d}".format(sequence),
+                "op": "batch",
+                "operations": [
+                    {
+                        "op": "put",
+                        "key": _b64(b"batch-added-a"),
+                        "value": _b64(random_value(generator)),
+                    },
+                    {"op": "delete", "key": _b64(b"recovery-key-00")},
+                    {
+                        "op": "put",
+                        "key": _b64(b"batch-added-b"),
+                        "value": _b64(random_value(generator)),
+                    },
+                ],
+            }
+            _record_recovery_ack(oracle, database, expected, sequence, batch)
+            sequence += 1
+
+            overwrite = {
+                "id": "recovery-{:04d}".format(sequence),
+                "op": "put",
+                "key": _b64(b"recovery-key-01"),
+                "value": _b64(random_value(generator)),
+            }
+            _record_recovery_ack(oracle, database, expected, sequence, overwrite)
+            put_count += 1
+            sequence += 1
+
+            delete = {
+                "id": "recovery-{:04d}".format(sequence),
+                "op": "delete",
+                "key": _b64(b"recovery-key-02"),
+            }
+            _record_recovery_ack(oracle, database, expected, sequence, delete)
+    finally:
+        oracle.close()
+
+    with open(database_path, "ab") as database_file:
+        database_file.write(b"KV")
+        database_file.flush()
+        os.fsync(database_file.fileno())
+    return expected, put_count
+
+
+def run_recovery_crash(iterations, seed, workdir=None):
+    if iterations > MAX_HEAVY_ITERATIONS:
+        print(
+            "HARNESS ERROR: recovery-crash is limited to {} iterations".format(
+                MAX_HEAVY_ITERATIONS
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    started_at = time.monotonic()
+    generator = random.Random(seed)
+    run_root, temporary = _create_run_root(workdir)
+    _print_banner("recovery-crash", seed, iterations, run_root, temporary)
+    passed = failed = inconclusive = errors = 0
+    preserve_artifacts = not temporary
+    try:
+        for iteration in range(1, iterations + 1):
+            iteration_directory = os.path.join(
+                run_root, "iteration-{:06d}".format(iteration)
+            )
+            os.mkdir(iteration_directory)
+            database_path = os.path.join(iteration_directory, "database.kv")
+            oracle_path = os.path.join(iteration_directory, "oracle.jsonl")
+            result = {
+                "result": "ERROR",
+                "attempts": [],
+                "statuses": {},
+                "sent_count": 0,
+                "pending_at_kill": False,
+                "kill_delay_ms": None,
+                "reason": "recovery-crash iteration did not complete",
+                "candidates": [],
+                "actual": None,
+            }
+            try:
+                expected, put_count = _prepare_recovery_crash_database(
+                    database_path, oracle_path, generator
+                )
+                result["sent_count"] = 19
+                result["statuses"] = {
+                    "recovery-{:04d}".format(index): ("ACK", "")
+                    for index in range(19)
+                }
+                target_put = generator.randint(1, put_count)
+                confirmed, kill_delay_ms, kill_reason = (
+                    _kill_during_recovery_replay(database_path, target_put)
+                )
+                result["kill_delay_ms"] = kill_delay_ms
+                if not confirmed:
+                    result["result"] = "INCONCLUSIVE"
+                    result["reason"] = kill_reason
+                else:
+                    actual = read_recovered_dump(database_path)
+                    result["actual"] = actual
+                    status, candidates, verification_reason = verify_oracle_log(
+                        oracle_path, actual
+                    )
+                    result["candidates"] = candidates
+                    if status == "PASS" and actual == expected:
+                        result["result"] = "PASS"
+                        result["reason"] = (
+                            "replay kill confirmed; open/check/dump passed; "
+                            "all ACKs and atomic batch match oracle"
+                        )
+                    elif status == "INCONCLUSIVE":
+                        result["result"] = "INCONCLUSIVE"
+                        result["reason"] = verification_reason
+                    else:
+                        result["result"] = "FAIL"
+                        result["reason"] = (
+                            "recovered state differs from acknowledged oracle: "
+                            + verification_reason
+                        )
+            except Exception as error:
+                result["reason"] = str(error)
+                result["result"] = "ERROR" if isinstance(error, (OSError, HarnessError)) else "FAIL"
+
+            if result["result"] == "PASS":
+                passed += 1
+            elif result["result"] == "FAIL":
+                failed += 1
+                preserve_artifacts = True
+            elif result["result"] == "INCONCLUSIVE":
+                inconclusive += 1
+                preserve_artifacts = True
+            else:
+                errors += 1
+                preserve_artifacts = True
+
+            if result["result"] != "PASS":
+                try:
+                    _report_failure(
+                        result,
+                        seed,
+                        iteration,
+                        "recovery-crash",
+                        iteration_directory,
+                    )
+                except OSError as error:
+                    errors += 1
+                    result["reason"] = "{}; unable to write failure metadata: {}".format(
+                        result["reason"], error
+                    )
+            _print_iteration(iteration, iterations, result, mode="recovery-crash")
+            if result["result"] in ("FAIL", "ERROR"):
+                break
+
+        verdict = (
+            "ERROR" if errors else
+            "FAIL" if failed else
+            "INCONCLUSIVE" if inconclusive else
+            "PASS" if passed == iterations else
+            "ERROR"
+        )
+        _print_summary(
+            passed, failed, inconclusive, seed, started_at, verdict, errors
+        )
+        if temporary and preserve_artifacts:
+            _safe_print("Artifacts retained: {}".format(run_root), flush=True)
+        return _exit_code(passed, failed, inconclusive, errors)
+    except Exception:
+        preserve_artifacts = True
+        raise
+    finally:
+        _cleanup_run_root(run_root, temporary, preserve_artifacts)
+
+
 def _run_python(code, *arguments, input_text=None):
     try:
         result = subprocess.run(
@@ -1917,7 +2269,11 @@ def main(argv=None):
         )
         _print_summary(0, 0, 0, args.seed, started_at, "NOT_IMPLEMENTED", errors=1)
         return 2
-    if args.mode in ("large-value", "max-batch") and args.iterations > MAX_HEAVY_ITERATIONS:
+    if args.mode in (
+        "large-value",
+        "max-batch",
+        "recovery-crash",
+    ) and args.iterations > MAX_HEAVY_ITERATIONS:
         _safe_print(
             "HARNESS/ARGUMENT ERROR: {} allows at most {} iterations".format(
                 args.mode, MAX_HEAVY_ITERATIONS
@@ -1934,6 +2290,12 @@ def main(argv=None):
         if args.mode in ("large-value", "max-batch"):
             return run_heavy_mode(
                 args.mode,
+                args.iterations,
+                args.seed,
+                args.workdir,
+            )
+        if args.mode == "recovery-crash":
+            return run_recovery_crash(
                 args.iterations,
                 args.seed,
                 args.workdir,

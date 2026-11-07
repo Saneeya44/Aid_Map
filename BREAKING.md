@@ -1,90 +1,83 @@
-# Crash Points and Failure Notes
+# BREAKING: Aid_Map Crash Windows
 
-This note describes crash windows in the current implementation, not a
-guarantee against arbitrary hardware or filesystem failure. Function line
-numbers refer to this source snapshot and may move as the code changes.
+This note describes code paths and process-kill evidence, not a guarantee
+against power loss or every storage device. References point to the current
+source; line numbers may change.
 
-## Crash windows
+## 1. Crash windows and recovery
 
-| # | Crash point and source | Possible database bytes | Startup response |
-|---:|---|---|---|
-| 1 | Initialization, [`Database.__init__`](./src/database.py#L21) | Empty/new file or unchanged old log; sidecar may exist | Replays from start |
-| 2 | Append descriptor opened, [`append_record`](./src/storage.py#L30) | Usually old log; creation may have happened | Replays old complete records |
-| 3 | Partial record header, [`append_record`](./src/storage.py#L40) | Incomplete trailing header | Truncates to record start and fsyncs |
-| 4 | Partial record payload, [`append_record`](./src/storage.py#L40) | Complete header, short payload | Truncates whole record and fsyncs |
-| 5 | Full record written, before/during fsync, [`append_record`](./src/storage.py#L45) | Incomplete tail or complete record; durability unknown | Repairs incomplete tail; replays complete valid record, even if unACKed |
-| 6 | Fsync returned, before PUT index update, [`Database.put`](./src/database.py#L296) | Complete PUT record | Replays PUT |
-| 7 | Complete BATCH append/fsync, before memory apply, [`Database.batch`](./src/database.py#L420) | One complete BATCH record | Replays every operation in that record |
-| 8 | After method return, before response flush, [`serve`](./src/cli.py#L293) [`serve`](./src/cli.py#L294) | For non-empty write, fsynced record | Replays it; client may have no ACK and must treat outcome as unknown |
-| 9 | During incomplete-tail repair, [`_read_records`](./src/storage.py#L51) | Truncate/fsync may be in progress | Later open retries; exact power-loss intermediate state is untested |
-| 10 | Strict CHECK, [`verify_records`](./src/storage.py#L109) and [`Database.check_file`](./src/database.py#L344) | Data file opened read-only | Reports incomplete/corrupt record; does not repair |
+| Crash point | File state | Recovery behavior |
+|---|---|---|
+| Before first append byte (`append_record`, `src/storage.py`) | No bytes for the new record; previous log remains. | Replay retains previous value/state. A kill exactly at this boundary is not independently tested. |
+| During append (`append_record`) | Incomplete header/payload may remain after force-kill. | `_read_records` truncates to the record start, flushes, and fsyncs. A caught partial-write exception instead attempts immediate truncate+fsync rollback. |
+| Full record before/during fsync (`append_record`) | Complete record can be visible even when caller received no ACK; persistence before fsync is uncertain. | A complete CRC-valid record is replayed; a torn one is removed. No ACK means the client must treat the operation as unknown. |
+| After fsync but before ACK (`Database.put` / `Database.batch`, then `serve`) | Complete record has passed file fsync, but output may not have been observed. | Reopen replays it. The oracle permits an eligible unACKed request to have committed or not. |
+| Batch append before return (`Database.batch`) | One BATCH record, not a sequence of independently visible members. | A torn record is discarded as a unit; a complete valid record is applied in order. There is no separate commit-marker record. |
+| Compaction before `os.replace` (`replace_records_atomically`, `src/storage.py`) | Original database path remains authoritative; temp snapshot may exist. | Recovery opens the original. Compaction kill tests cover snapshot/pre-replacement cases. |
+| Compaction after `os.replace`, before cleanup (`replace_records_atomically`) | New complete snapshot is at the database path; the former temp name has moved. | Recovery opens the replacement. On non-Windows, directory fsync follows; Windows has no equivalent directory fsync here. |
 
-DELETE shares the append windows above when the key exists. Deleting a missing
-key returns `False` without appending; SERVE still ACKs the successful method
-return. This is a no-op, not a durable delete record.
+`Database._recover` rebuilds only an in-memory index. The
+`recovery-crash` mode pauses within record replay, force-kills the child, then
+reopens and verifies using CHECK, DUMP, and the independent fsynced ACK
+oracle. The three-iteration seeded smoke passed. It does not emulate
+power-loss interruption during the repair truncate/fsync itself.
 
-`FileLock` serializes operations across processes by locking the sidecar;
-the per-instance `threading.RLock` serializes threads using one object.
-Lock-release cleanup on abrupt process termination is delegated to the OS.
-There is no compaction, rename, or file-replacement crash window because no
-such implementation was found.
+## 2. Persistence and atomicity argument
 
-## Ordering argument
+The ordering is: validate/encode -> acquire `threading.RLock` and sidecar
+`FileLock` -> refresh/recover -> append full record -> `os.fsync(database
+fd)` -> update memory -> return/release locks -> SERVE writes and flushes ACK.
+Compaction writes and fsyncs the temporary snapshot before `os.replace`; on
+POSIX it then fsyncs the parent directory. The one-record BATCH format gives
+whole-record replay for a torn tail, but does not implement the official
+separate commit-marker boundary in B2.
 
-For a successful non-empty write: encode/validate -> acquire locks -> recover
-and refresh -> append the encoded record (looped `os.write`) -> `os.fsync` the
-database file -> update the in-memory index -> return/release locks -> write
-the SERVE ACK line -> flush stdout. BATCH uses one BATCH record and applies
-members to memory only after the record append/fsync returns.
+## 3. Known weaknesses and limits
 
-An unACKed request is not necessarily rolled back: a full record may be
-visible or durable even if the process dies before the caller sees a response.
-Conversely, an ACKed write is expected to have returned from the code's
-`os.fsync` call before ACK generation. These statements do not prove the
-behavior of every storage device, filesystem, or power-loss scenario.
+- Database/lock-file creation is not followed by directory fsync. Compaction
+  also lacks directory fsync on Windows, so sudden power-loss durability of
+  directory entries/replacement is not established.
+- Force-kill tests terminate processes; they do not simulate power failure,
+  volatile device caches, or all NTFS/filesystem failure modes.
+- A one-byte-short final record causes recovery to discard that whole record,
+  which could be the last ACKed operation; the official F4 guarantee is not
+  established and may conflict with current tail repair.
+- There is no separate batch commit marker. B2's stated visibility boundary
+  is therefore not represented.
+- `max_bytes` applies to append operations on an explicitly configured
+  `Database` instance, is not persisted, and does not cap compaction's
+  temporary snapshot. Rollback failure is reported but can leave repair work
+  for the next open.
+- Benchmark transcripts and complete original AI prompt histories are not
+  checked into the repository.
 
-## Known weaknesses
+## 4. Prioritized improvements for 24 hours
 
-1. There is no directory fsync after creation of a new database or lock
-   sidecar, so persistence of the directory entry across sudden power loss is
-   not established.
-2. No configurable file-size cap, disk-full management policy, compaction, or
-   bounded log-growth mechanism exists.
-3. Recovery is a linear replay; there is no verified one-million-key latency
-   or memory benchmark in this repository.
-4. The record CRC excludes magic and payload-length fields. Strict validation
-   catches many malformed records, but this is not a cryptographic integrity
-   scheme or general corruption-repair mechanism.
-5. CHECK requires an existing lock sidecar and validates the data without
-   repairing it; an absent sidecar yields an error rather than a read-only
-   unlocked scan.
+1. Define the judging durability contract and implement/test the required
+   directory durability path on Windows; add power-cut or VM-reset evidence
+   if the rubric requires power-loss claims.
+2. Resolve the batch-marker and F4 acceptance mismatches explicitly. Add
+   deterministic hooks/tests for every single-write boundary, torn-tail
+   repair, compaction replacement, and long-batch concurrency.
+3. Check in benchmark transcripts, run the complete mode matrix on the judge
+   filesystem, and collect each teammate's original chronological prompts.
 
-## Observed failed attempts
+## 5. TTL design (proposed; not implemented)
 
-- **Harness infrastructure failure, not a confirmed database failure:** a
-  prior Windows smoke run encountered `OSError: [Errno 22] Invalid argument`
-  while a writer thread was still using the SERVE stdin pipe as cleanup closed
-  it. The harness cleanup was changed to stop/join writers before closing
-  stdin. The exact command and seed were not retained in the evidence available
-  for this document pass. This observed failure does not show a lost write or
-  an engine correctness defect.
-- No confirmed crash-induced engine correctness failure is documented in the
-  evidence available for this document pass. Do not treat absence of a report
-  as proof that no defect exists.
+Persist an absolute UTC expiration timestamp in a versioned PUT payload
+(including each PUT member of a BATCH); do not persist a process-local
+monotonic-clock value, which cannot be compared after restart. A read treats
+the key as absent when `now_utc_ms >= expires_at_utc_ms`. Compaction omits
+expired entries and emits ordinary live PUT snapshots; an explicit delete
+still writes a tombstone. Define clock rollback as delaying expiration until
+the wall clock reaches the stored deadline again, and test that contract.
+This needs a format-version/migration decision before implementation.
 
-## Priorities for the next 24 hours
+## Observed failures
 
-1. Add and test directory durability/creation semantics on the actual judging
-   filesystem; document a chosen platform contract.
-2. Implement a bounded-size policy with fault-injection tests for ENOSPC, or
-   explicitly remove size-cap claims from the judging rubric.
-3. Define compaction and recovery performance requirements, then add a
-   separately measured compaction implementation and one-million-key benchmark
-   only if required by the official specification.
-
-## Team input needed
-
-Paste the official crash-point/scenario text and exact expected outcomes here
-or provide the official document. Also provide any failed test logs not
-represented by the repository. No failure narrative should be added without
-the command, environment, and observed result.
+No confirmed crash-induced data-loss failure is recorded in this submission.
+An earlier Windows harness cleanup reported `OSError: [Errno 22] Invalid
+argument` while a writer still used the SERVE pipe; cleanup ordering was
+adjusted to stop/join writers before closing streams. The exact command and
+seed were not retained, so this is infrastructure history, not evidence of
+an engine defect.

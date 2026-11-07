@@ -1,132 +1,86 @@
-# Aid_Map Official Requirements Checklist
+# Aid_Map Submission Requirements Checklist
 
-## Evidence and status rules
+## Status key
 
-The official requirements below are transcribed from the user-provided
-“Official Kill It and Prove It — Scenario Reference” (Problem Statement,
-Section 5, pages 5–8, plus Additional official requirements). The requested
-`OFFICIAL_SCENARIOS.md` file was not found in the workspace; the scenario
-reference provided in the conversation was used. Scenario details and current
-implementation mapping are in the 32-row matrix in
-[ARCHITECTURE.md](./ARCHITECTURE.md).
+- **VERIFIED** — matching source behavior and a test/run or explicit reported
+  measurement supports the claim.
+- **IMPLEMENTED BUT UNVERIFIED** — source support exists, but required
+  scenario-level or platform evidence is incomplete.
+- **MISSING** — required implementation or submission material is absent.
+- **BLOCKED** — evidence or decision from the team/judges is needed.
 
-**Status meanings**
+The official A1-F4 descriptions and current scenario-by-scenario analysis are
+in [ARCHITECTURE.md](./ARCHITECTURE.md). Benchmark figures below were supplied
+as recorded team results; their raw console transcripts are not checked into
+the current worktree.
 
-- **VERIFIED** — matching behavior was exercised and the test result is
-  recorded.
-- **NOT VERIFIED** — source or related tests exist, but this exact official
-  criterion has not been demonstrated by evidence reviewed here.
-- **NOT IMPLEMENTED** — the required mechanism is absent or current behavior
-  conflicts with the official criterion.
-- **BLOCKED** — the official acceptance details needed to judge compliance
-  have not been supplied.
+## Engine and storage
 
-No correctness tests were run for this documentation update. Test references
-below identify code evidence only, not a new test result. Tests in legacy
-scripts that mutate repository-root `.kv` files are not treated as safe
-automated verification.
-
-## Engine
-
-| Official requirement | Status | Current evidence and gap |
+| Requirement | Status | Evidence / remaining limitation |
 |---|---|---|
-| Keys: 1–1,024 bytes | NOT VERIFIED | `src/database.py:_encode_put`, `_encode_delete`; SERVE checks in `src/cli.py:_parse_serve_request`; limit coverage in `tests/test_serve.py::test_key_value_and_batch_limits_are_validated`. |
-| Values: 0–1 MiB | NOT VERIFIED | `src/database.py:_encode_put`; `tests/test_torture_scenarios.py::test_maximum_one_mib_value_survives_restart`; this is not crash-during-write verification. |
-| At least 1,000,000 keys | NOT VERIFIED | No explicit engine key-count cap found; no 1,000,000-key capacity or memory test exists. |
-| Atomic batches up to 10,000 operations | NOT VERIFIED | Single BATCH record in `src/database.py:Database.batch` and `src/storage.py:append_record`; `tests/test_torture_scenarios.py::test_engine_accepts_10000_batch_operations_and_rejects_10001` covers the boundary, and `test_force_kill_during_partial_batch_keeps_entire_old_state` covers a partial 2-op record. No 10,000-op mid-write crash test. |
-| At least two concurrent writers | NOT VERIFIED | `src/locking.py:FileLock` and `src/database.py` operations use a shared sidecar process lock; `tests/test_cross_process_consistency.py` has two-process sequential and barrier-synchronized writes. These named tests were not run in this update. |
-| One authoritative database file | NOT VERIFIED | Log in the requested `.kv` path is the persisted data source; index is in memory. `.lock` sidecar is for locking, not data. No snapshot/compaction secondary data file exists. |
-| Crash-safe compaction | NOT IMPLEMENTED | No compaction, replacement, rename/swap, or temporary compaction file implementation in `src/`. |
-| Configurable maximum file size | NOT IMPLEMENTED | No `--max-bytes`, file cap, or equivalent engine configuration found. ENOSPC fault injection is not a configured size limit. |
-| Recovery under 2 seconds with 1,000,000 keys | NOT VERIFIED | `src/database.py:Database._recover` linearly replays records into a Python dictionary; no million-key benchmark or timed recovery test found. |
-| BATCH commit-marker ordering required by B2/B3 | NOT IMPLEMENTED | Current format uses one complete CRC-checked BATCH record; it has no separate commit marker. B2’s “fully written but before commit marker means none visible” cannot be implemented by the current record protocol. |
-| B5 ordering is defined in README and honored | NOT IMPLEMENTED | `src/database.py:_apply_operations` applies operations in supplied order, but README does not define the result for PUT/DELETE operations on the same key; no focused test for this conflict case was found. |
-| F4 one-byte manual truncation loses at most the last unACKed record | NOT IMPLEMENTED | `src/storage.py:_read_records` truncates an incomplete tail to the beginning of that entire record, which may be an ACKed last record. Existing tail-repair test appends `b"KV"` after a valid record, not truncation of an ACKed final record. |
+| Keys are 1-1,024 bytes | VERIFIED | Validation in `src/database.py` and SERVE request parser; limit cases in `tests/test_serve.py`. |
+| Values are 0-1 MiB | VERIFIED | Validation in `Database._encode_put` / SERVE; `test_maximum_one_mib_value_survives_restart` covers max-sized value/reopen. Crash-at-each-write-boundary remains unverified (A7). |
+| At least 1,000,000 live keys | VERIFIED | Supplied benchmark: one million inserted in 54.554 s; 1,000,000 keys and sampled values correct after recovery. |
+| Atomic batches up to 10,000 operations; reject 10,001 | VERIFIED | One BATCH record; `test_engine_accepts_10000_batch_operations_and_rejects_10001`, `test_batch_exceeding_limit_is_rejected_atomically`, and torture verifier/mode tests. Exact 10,000-op mid-write crash and <2 s recovery remain unverified. |
+| At least two concurrent writers | VERIFIED | Sidecar process lock; cross-process tests include forced kill and same-key barrier writes. Does not verify every concurrency interleaving. |
+| One authoritative database file | VERIFIED | Record log is authoritative; index is memory-only. `.lock` is metadata and compaction temp is transient; replacement changes the authoritative path. |
+| Crash-safe compaction | IMPLEMENTED BUT UNVERIFIED | `Database.compact` and atomic same-directory temp + fsync + `os.replace`; compaction kill and failure tests cover before/after replacement. Windows directory fsync is absent; no power-cut test inside OS replacement. |
+| Configurable maximum database size | VERIFIED | `Database(..., max_bytes=N)` prechecks complete record size; `tests/test_max_bytes.py` covers cap, batch, concurrent cap and rollback. Option is instance-only, not persisted; CLI exposes it on `open`, not CLI write subcommands. Compaction is not capped. |
+| Partial ENOSPC append rollback and no false ACK | VERIFIED | `append_record` truncates to prior size and fsyncs after partial failure; max-bytes tests cover partial PUT/BATCH rollback and SERVE ERR/no ACK. Rollback itself can fail and is explicitly reported. |
+| Recovery under 2 seconds with 1,000,000 keys | VERIFIED | Supplied measurement: 0.809168 s, 1,000,000 live keys and sampled values correct. Recovery after all-live compaction: 1.627460 s. |
+| B2 separate commit-marker boundary | MISSING | The current format has one checksummed BATCH record and no separate commit marker. A full valid batch can be replayed. |
+| Same-key batch ordering defined and honored | IMPLEMENTED BUT UNVERIFIED | Source applies supplied order and README states last operation wins; no focused same-key ordering test found. |
+| F4 one-byte truncation loses at most last unACKed record | MISSING | Tail repair discards the whole incomplete final record, potentially including an ACKed record. Exact official condition is not established and may conflict with current design. |
 
-## CLI
+## CLI and interface
 
-| Official requirement | Status | Current evidence and gap |
+| Requirement | Status | Evidence / remaining limitation |
 |---|---|---|
-| All eight CLI commands | NOT VERIFIED | `src/cli.py:main` defines `put`, `get`, `del`, `batch`, `open`, `dump`, `check`, and `serve`; fake-database and protocol coverage is in `tests/test_cli.py` and `tests/test_serve.py`. |
-| PUT/GET/DELETE/BATCH/OPEN/DUMP/CHECK/SERVE behavior matches official interface | BLOCKED | The supplied official requirements specify the command count but not per-command syntax/output acceptance; full Section 4 details are needed to judge exact compatibility. |
+| Required eight CLI commands | VERIFIED | PUT, GET, DEL, BATCH, OPEN, DUMP, CHECK, SERVE are implemented and covered by CLI/protocol tests. `compact` is an additional ninth command. |
+| Documented syntax matches implementation | VERIFIED | README and [JUDGE_DEMO.md](./JUDGE_DEMO.md) use `--db PATH`, supported legacy path-first forms, batch text syntax and JSONL/Base64 SERVE. |
+| COMPACT command | VERIFIED | `python -m src.cli compact --db PATH`; engine compaction tests validate data and replacement behavior. |
+| Max-bytes usage explained correctly | VERIFIED | Documentation distinguishes CLI `open --max-bytes` (that instance only) from passing `max_bytes` to the Database API used for writes. |
 
-## Torture harness
+## Crash, scenario and torture verification
 
-| Official requirement | Status | Current evidence and gap |
+| Requirement | Status | Evidence / remaining limitation |
 |---|---|---|
-| Default: 500 iterations | NOT VERIFIED | `torture.py` argparse default is 500; no 500-iteration result is recorded in this update. |
-| Seed is mandatory | NOT VERIFIED | `torture.py` declares `--seed` required; CLI execution not repeated in this update. |
-| Independent ACK oracle | NOT VERIFIED | `torture.py:OracleLog.record`, `verify_oracle_log`; `tests/test_torture_harness.py::test_verifier_uses_fsynced_ack_events_from_oracle_log`. Oracle ACK events are flushed/fsynced by source; no new run performed here. |
-| Targeted torture modes: large values and large batches | NOT VERIFIED | `SUPPORTED_MODES` contains `large-value` and `max-batch`; heavy modes capped at five iterations. |
-| Targeted recovery-crash mode | NOT IMPLEMENTED | `recovery-crash` is listed as known but is not in `SUPPORTED_MODES`; CLI reports it unsupported. |
-| Targeted compaction mode | NOT IMPLEMENTED | `compaction-crash` is listed as known but is not in `SUPPORTED_MODES`; engine compaction is also absent. |
-| Targeted disk-full mode | NOT IMPLEMENTED | `disk-full` is listed as known but is not in `SUPPORTED_MODES`. A single safe fault-injection test exists for a PUT append error, not a harness mode or configured cap. |
-| F1: 500 random kills/restarts maintain invariant | NOT VERIFIED | Basic harness loops isolated runs and checks recovered state against oracle; no 500-iteration result is available as evidence here. |
+| Torture defaults to 500; seed required | VERIFIED | `torture.py` parser default and required `--seed`; 500-run result below. |
+| Independent ACK oracle, durably separate | VERIFIED | `OracleLog.record` flushes and fsyncs events; `test_verifier_uses_fsynced_ack_events_from_oracle_log`; verifier tests reject lost/wrong ACKed state and accept legal unACKed outcomes. |
+| Basic torture: 500 random kills/restarts | VERIFIED | Supplied result: seed `67890`, 500 PASS, 0 FAIL, 0 INCONCLUSIVE, 0 ERROR, elapsed 194.24 s. Raw transcript not checked in. |
+| `large-value` mode | IMPLEMENTED BUT UNVERIFIED | Mode generates 1 MiB PUT/overwrite/delete and force-kills active SERVE; max five iterations. Exact A1-A5 boundary coverage is not proven. |
+| `max-batch` mode | IMPLEMENTED BUT UNVERIFIED | Mode generates mixed/repeated-key batches of exactly 10,000 operations and reuses oracle verifier; 10,001 rejection is tested. Exact recovery-time target and all-or-none mid-batch kill need retained run evidence. |
+| `recovery-crash` mode | VERIFIED | Current validation: seed `12345`, 3/3 PASS in 1.64 s. Each child paused inside `Database._recover` PUT replay, was force-killed after the marker, then fresh open/CHECK/DUMP/oracle verification passed. No standalone log file is checked in; no claim of repeated kills on the same recovery run. |
+| `compaction-crash` mode | IMPLEMENTED BUT UNVERIFIED | Harness and scenario tests cover snapshot-write, pre-replace, and post-replace cases. No kill inside `os.replace` or power-loss validation. |
+| `disk-full` mode | VERIFIED for injected ENOSPC only | Partial-write ENOSPC is injected; SERVE must return ERR, prior state is checked. It does not exhaust a physical disk or cover every hardware failure. |
+| F1: 500-run invariant | VERIFIED | Same supplied 500/500 basic run and independent oracle result above. |
+| F2: repeated recovery kills | IMPLEMENTED BUT UNVERIFIED | Isolated recovery-crash iterations pass, but repeated interruption during repair or multiple kills of the same database are not demonstrated. |
+| F3: kill/reopen one million keys under 2 seconds | IMPLEMENTED BUT UNVERIFIED | Clean one-million-key reopen is measured at 0.809168 s; no kill during the million-key loading/recovery path was measured. |
+| Complete A1-F4 proof matrix | IMPLEMENTED BUT UNVERIFIED | All 32 scenarios are mapped in ARCHITECTURE.md with exact expected outcomes, actual disk/recovery behavior, code, tests, and explicit status. Several required crash points remain incomplete. |
 
-## Official A1–F4 scenario checklist
+## Documentation, performance and submission
 
-`NOT VERIFIED` does not mean the exact scenario passed. See the linked
-architecture matrix for official expected outcomes, actual disk/recovery
-analysis, source locations, and test names.
-
-| Scenario | Official acceptance criterion (concise transcription) | Status |
+| Requirement | Status | Evidence / remaining limitation |
 |---|---|---|
-| A1 | Before any PUT bytes: key absent or previous value | NOT VERIFIED |
-| A2 | Partial PUT record: torn bytes ignored; absent or previous value | NOT VERIFIED |
-| A3 | Full record before fsync: old or new, no corruption | NOT VERIFIED |
-| A4 | After fsync before PUT success return: new value present | NOT VERIFIED |
-| A5 | Immediately after PUT success return: new value present | NOT VERIFIED |
-| A6 | Kill during DELETE: old value or absent, never corrupted | NOT VERIFIED |
-| A7 | Kill during 1 MB PUT: A1–A5 guarantees | NOT VERIFIED |
-| B1 | After 3/10 batch operations written: none visible | NOT VERIFIED |
-| B2 | After all 10 written, before commit marker: none visible | NOT IMPLEMENTED |
-| B3 | After commit marker before fsync: all or none | NOT VERIFIED |
-| B4 | After batch success return: all visible | NOT VERIFIED |
-| B5 | Same-key PUT/DELETE batch ordering documented and honored | NOT VERIFIED |
-| B6 | Halfway through 10,000-op batch: none visible; recovery <2 seconds | NOT VERIFIED |
-| C1 | Kill during replay in open: next open correct | NOT VERIFIED |
-| C2 | Kill during torn-tail repair: next open succeeds | NOT VERIFIED |
-| C3 | Kill during pre-replacement compaction: old file authoritative | NOT IMPLEMENTED |
-| C4 | Kill during compaction swap: exactly one complete state authoritative | NOT IMPLEMENTED |
-| C5 | Kill after swap before cleanup: intact data; temp files cleaned/ignored | NOT IMPLEMENTED |
-| C6 | Kill during close: same guarantees as other kills | NOT VERIFIED |
-| D1 | Two writers, different keys: all ACKed PUTs survive kill | NOT VERIFIED |
-| D2 | Two writers, same key: one complete value actually written | NOT VERIFIED |
-| D3 | Long batch with individual PUTs: atomic batch and ACKed PUTs survive | NOT VERIFIED |
-| D4 | GET during batch sees before or after, never partial | NOT VERIFIED |
-| E1 | File cap during PUT: clean error; old data readable | NOT IMPLEMENTED |
-| E2 | File cap mid-batch: error; no batch operations visible | NOT IMPLEMENTED |
-| E3 | Kill after file cap: previously ACKed data survives | NOT IMPLEMENTED |
-| E4 | File cap during compaction: no data loss; database opens | NOT IMPLEMENTED |
-| E5 | Deletes plus compaction free space for later writes | NOT IMPLEMENTED |
-| F1 | 500 random kills/restarts; invariant every iteration | NOT VERIFIED |
-| F2 | Repeated kills during recovery; recovery remains idempotent | NOT VERIFIED |
-| F3 | Kill/reopen with 1,000,000 keys under 2 seconds; ACKed keys present | NOT VERIFIED |
-| F4 | One-byte manual truncation; open succeeds, at most last unACKed record lost | NOT IMPLEMENTED |
+| README overview, setup, CLI, SERVE, storage, recovery, compaction, max-bytes, torture | VERIFIED | Updated `README.md`; examples follow inspected CLI/API syntax. |
+| Architecture diagram, format, ordering, locking/recovery/compaction/disk-full, three guarantee arguments | VERIFIED | `ARCHITECTURE.md` plus source diagram `diagrams/aid_map_architecture.mmd`; claims explicitly bounded. |
+| BREAKING within two printed pages | IMPLEMENTED BUT UNVERIFIED | Condensed five-section `BREAKING.md`; printer/font/pagination not validated in this environment. |
+| TTL design answer | VERIFIED as proposal only | Proposed in BREAKING and JUDGE_DEMO; TTL is not implemented. |
+| Offline, practical 15-minute judge guide | VERIFIED | `JUDGE_DEMO.md`; commands use disposable temp paths and call out illustrative output. Expensive benchmarks are not part of live steps. |
+| Required AI prompt history, chronological/original/unmodified, from all teammates | MISSING | `PROMPTS.md` is a collection template only; no original teammate contributions are present. Teammates must paste their complete original chronological prompts, tool/interface and approximate time. |
+| Ignore generated benchmark databases, torture artifacts and Python caches | VERIFIED | `.gitignore` excludes `benchmark_*.db`, torture temp directories, Python bytecode/cache, `.kv`, lock and compaction temp files. Existing user files were not deleted. |
+| Million-key benchmark | VERIFIED | 1M insertion 54.554 s; recovery 0.809168 s; all keys present and sampled values correct. |
+| All-live compaction interpretation | VERIFIED | 31,001,800 → 40,000,000 bytes; no obsolete records existed, so snapshot grew and this is not the churn shrinkage test. Reopen 1.627460 s; all million keys present. |
+| Churn compaction acceptance | VERIFIED | 1M puts + 1M deletes; zero live keys; 51,003,600 → 0 bytes; 100% reclaimed; 166.26 s; reopen passed. |
+| No external runtime dependencies | VERIFIED | Implementation and harness use Python standard library. |
+| Merge into `main` | BLOCKED pending team review | This task authorizes a push to `integration-final`, not an automatic main merge. Compare `origin/main` to the pushed integration commit, then open/review a PR or merge only after team approval. |
 
-## Documentation and submission
+## Validation record
 
-| Official requirement | Status | Current evidence and gap |
-|---|---|---|
-| ARCHITECTURE.md includes an architecture diagram | NOT VERIFIED | Mermaid diagram present in `ARCHITECTURE.md`; no rendering validation in this update. |
-| ARCHITECTURE.md includes a 32-row proof matrix | NOT VERIFIED | A1–F4 are listed with official expected state, current disk/recovery mechanism, code locations, and evidence/gaps. |
-| ARCHITECTURE.md includes three guarantee arguments | NOT VERIFIED | Durability, batch atomicity, and recoverability sections present; claims remain limited to inspected source. |
-| BREAKING.md is at most two printed pages | NOT VERIFIED | `BREAKING.md` exists and is concise in source, but printed page count depends on printer/font/format and was not checked here. |
-| BREAKING.md has five required sections | BLOCKED | The names/content rules for those five sections were not included in the supplied official-requirements text; compare with the PDF before claiming compliance. |
-| PROMPTS.md contains chronological, original, unedited prompts | NOT VERIFIED | Current `PROMPTS.md` is explicitly a blank collection template; original chronological teammate prompts have not been supplied. |
-
-## Performance and verification gaps
-
-- No million-key dataset or recovery benchmark verifies the 2-second target.
-- No kill point is tested at every single-write boundary (before first byte,
-  complete write/pre-fsync, post-fsync/pre-return, or during DELETE).
-- The batch implementation has no separate commit marker, so B2 is a protocol
-  mismatch; 10,000-operation crash timing and the 2-second recovery target are
-  unverified.
-- Recovery interruption has one test after record scanning, but not repeated
-  kills during tail truncation/fsync.
-- There is no compaction, configured file-size cap, or the corresponding
-  crash/disk-full harness mode.
-- Tests named in this document were inspected but not executed during this
-  documentation update. In particular, do not run legacy scripts that mutate
-  project-root `.kv` files as part of this verification.
+Supplied prior results: **111 tests, OK, 8.197 seconds**; basic torture
+**500 PASS / 0 FAIL / 0 INCONCLUSIVE / 0 ERROR**, seed `67890`, 194.24 s.
+Current isolated full-suite rerun: **111 tests, OK**, unittest-reported
+14.590 s. Current required smokes: basic **5/5 PASS**, seed `12345`, 2.15 s;
+recovery-crash **3/3 PASS**, seed `12345`, 1.64 s. The suite was run from a
+temporary current directory because legacy discovery modules execute
+import-time scripts that write/delete relative `.kv` files.

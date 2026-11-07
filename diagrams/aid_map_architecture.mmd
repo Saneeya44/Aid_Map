@@ -1,84 +1,18 @@
-flowchart TD
-    subgraph ClientAPI ["Client API & Ingress"]
-        CLI["CLI (src/cli.py)"]
-        Serve["SERVE Loop (src/cli.py:serve)\nJSONL on stdin -> ACK/ERR on stdout"]
-        DB["Database API (src/database.py:Database)"]
-        CLI --> DB
-        Serve --> DB
-    end
-
-    subgraph ConcurrencyLocks ["Concurrency Locks"]
-        RLock["threading.RLock (In-Process Thread Lock)"]
-        FileLock["FileLock (src/locking.py)\nmsvcrt.locking (Win) / fcntl.flock (POSIX)"]
-        LockSidecar[("Lock Sidecar: <path>.lock\n1 byte byte-range lock")]
-        DB --> RLock
-        RLock --> FileLock
-        FileLock --> LockSidecar
-    end
-
-    subgraph MemoryIndex ["In-Memory State"]
-        MemIndex["In-Memory Dict Index (self.index)\nKey -> Value mapping\n(Rebuilt on open; NOT persisted independently)"]
-    end
-
-    subgraph WritePath ["Write Path & Numbered Ordering Sequence"]
-        W1["1. Encode payload & compute CRC32"]
-        W2["2. Acquire RLock then FileLock"]
-        W3["3. _recover(): sync memory index with log"]
-        W4["4. append_record(): os.write(fd, record) to log"]
-        W5["5. os.fsync(fd): flush bytes to physical disk"]
-        W6["6. Update in-memory dict index"]
-        W7["7. Release FileLock then RLock"]
-        W8["8. Return success / Emit ACK <id> to stdout"]
-        W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7 --> W8
-    end
-
-    subgraph OnDiskFormat ["On-Disk Format (database.kv)"]
-        Header["14-Byte Record Header (>4sBBII):\n- Magic: 'KVDB' (4B)\n- Version: 1 (1B)\n- Record Type: 1=PUT, 2=DEL, 3=BATCH (1B)\n- Payload Length: uint32 (4B)\n- CRC32: uint32 over version+type+payload (4B)"]
-        Payloads["Payload Formats:\n- PUT (1): key_len(2B) + key + value\n- DELETE (2): key_len(2B) + key\n- BATCH (3): op_count(4B) + [type(1B)+key_len(2B)+key+(val_len(4B)+val)]*"]
-        CommitLogic["Commit Marker Logic:\n- Self-contained per record (No separate commit file)\n- Atomicity via single BATCH record + full-payload CRC32"]
-        Header --> Payloads
-        Payloads --> CommitLogic
-    end
-
-    subgraph RecoveryRoutine ["Recovery Routine (_recover in src/database.py)"]
-        R1["open(path, 'r+b')"]
-        R2["Read 14-byte Header"]
-        R3{"Header complete?"}
-        R4{"EOF reached?"}
-        R5["Ready: Index Rebuilt"]
-        R6["file.truncate(record_start) & os.fsync()\n(Discard torn tail)"]
-        R7{"Magic == 'KVDB'\n& Version == 1?"}
-        R8["Raise ValueError\n(Invalid header)"]
-        R9["Read Length bytes of Payload"]
-        R10{"Payload complete?"}
-        R11{"CRC32 matches Header?"}
-        R12["Raise ValueError\n(Checksum mismatch)"]
-        R13["Decode record & update self.index"]
-
-        R1 --> R2
-        R2 --> R3
-        R3 -- No --> R4
-        R4 -- Yes (0 bytes) --> R5
-        R4 -- No (1-13 bytes) --> R6 --> R5
-        R3 -- Yes --> R7
-        R7 -- No --> R8
-        R7 -- Yes --> R9
-        R9 --> R10
-        R10 -- No (Torn payload) --> R6
-        R10 -- Yes --> R11
-        R11 -- No --> R12
-        R11 -- Yes --> R13
-        R13 --> R2
-    end
-
-    subgraph MissingComponents ["Missing / Unimplemented Specifications"]
-        NoCompact["Compaction Routine: MISSING\n(File does not shrink after deletes)"]
-        NoDiskGuard["Disk-Full Guard / --max-bytes: MISSING\n(No file-size cap enforced by engine)"]
-    end
-
-    DataLog[("Authoritative Data File: database.kv\n(Append-Only Log)")]
-    W4 --> DataLog
-    R1 --> DataLog
-    R6 --> DataLog
-    W6 --> MemIndex
-    R13 --> MemIndex
+flowchart LR
+    User --> CLI[src/cli.py]
+    Harness[torture.py] -->|JSONL requests| SERVE[src/cli.py serve]
+    CLI --> DB[src/database.py Database]
+    SERVE --> DB
+    DB -->|thread RLock + process FileLock| Lock[src/locking.py]
+    Lock --> Sidecar[(database.kv.lock)]
+    DB --> Recover[_recover]
+    Recover --> Read[src/storage.py read_records]
+    Read --> Log[(authoritative append-only database file)]
+    DB --> Append[append_record]
+    Append -->|os.write + fsync| Log
+    DB --> Index[per-process dictionary index]
+    DB --> Compact[compact]
+    Compact --> Temp[temporary snapshot in same directory]
+    Temp -->|fsync then os.replace| Log
+    Harness --> Oracle[(separate oracle.jsonl; flush + fsync each event)]
+    Harness -->|open, check, dump| CLI

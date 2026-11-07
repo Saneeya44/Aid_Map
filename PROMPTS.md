@@ -5,6 +5,13 @@
 > was created. Do not present reconstructed or summarized text as a verbatim
 > original prompt.
 
+## Missing teammate contributions
+
+No complete original prompt contribution from any teammate is currently
+present in this file. This requirement remains **MISSING** until each teammate
+adds their own source text. The existing placeholder below is not a prompt
+and must not be submitted as one.
+
 ## Instructions for each teammate
 
 Paste your complete prompt history in chronological order. Preserve the exact

@@ -387,7 +387,7 @@ class TortureHarnessTests(unittest.TestCase):
         self.assertEqual(args.mode, "basic")
         self.assertIsNone(args.workdir)
 
-        for mode in ("compaction-crash", "disk-full"):
+        for mode in ("recovery-crash", "compaction-crash", "disk-full"):
             with self.subTest(mode=mode):
                 args = torture.build_parser().parse_args([
                     "--seed", "1", "--mode", mode
@@ -440,16 +440,60 @@ class TortureHarnessTests(unittest.TestCase):
         self.assertIn("C:\\Temp\\aid-map-run", text)
         self.assertIn("removed after complete PASS", text)
 
-    def test_unsupported_mode_returns_nonzero_with_actionable_message(self):
+    def test_mode_guard_reports_unavailable_mode_without_running_it(self):
         output = io.StringIO()
         errors = io.StringIO()
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-            exit_code = torture.main([
-                "--seed", "123", "--mode", "recovery-crash"
-            ])
+        with patch.object(torture, "SUPPORTED_MODES", ("basic",)):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                exit_code = torture.main([
+                    "--seed", "123", "--mode", "recovery-crash"
+                ])
         self.assertEqual(exit_code, 2)
         self.assertIn("NOT IMPLEMENTED: mode recovery-crash", errors.getvalue())
         self.assertIn("verdict=NOT_IMPLEMENTED", output.getvalue())
+
+    def test_recovery_crash_mode_kills_during_replay_and_verifies_oracle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exit_code = torture.run_recovery_crash(1, 7731, directory)
+
+            self.assertEqual(exit_code, 0, output.getvalue())
+            text = output.getvalue()
+            self.assertIn("ITER 1/1 PASS", text)
+            self.assertIn("replay kill confirmed", text)
+            self.assertIn("open/check/dump passed", text)
+            self.assertIn("all ACKs and atomic batch match oracle", text)
+            self.assertIn("SUMMARY PASS=1 FAIL=0 INCONCLUSIVE=0", text)
+
+    def test_recovery_crash_without_replayed_put_is_not_confirmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, "empty.kv")
+            with open(database_path, "wb"):
+                pass
+
+            confirmed, _, reason = torture._kill_during_recovery_replay(
+                database_path, 1
+            )
+
+        self.assertFalse(confirmed)
+        self.assertIn("before the replay pause", reason)
+
+    def test_recovery_crash_without_pause_cannot_report_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with patch.object(
+                torture,
+                "_kill_during_recovery_replay",
+                return_value=(False, None, "replay pause was not observed"),
+            ):
+                with contextlib.redirect_stdout(output):
+                    exit_code = torture.run_recovery_crash(1, 7731, directory)
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("ITER 1/1 INCONCLUSIVE", output.getvalue())
+        self.assertIn("verdict=INCONCLUSIVE", output.getvalue())
+        self.assertNotIn("ITER 1/1 PASS", output.getvalue())
 
     def test_missing_prerequisites_are_reported_without_starting_harness(self):
         with tempfile.TemporaryDirectory() as directory:

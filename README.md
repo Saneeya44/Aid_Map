@@ -6,6 +6,13 @@ known limitations; it is not a blanket claim that every crash scenario passes.
 See [REQUIREMENTS_CHECKLIST.md](./REQUIREMENTS_CHECKLIST.md) for evidence and
 remaining gaps.
 
+The CLI and SERVE adapter in `src/cli.py` call the `Database` API in
+`src/database.py`. Records are encoded, appended and fsynced by
+`src/storage.py`; `src/locking.py` serializes threads and processes. The index
+is rebuilt in memory by replaying the authoritative database log. Compaction
+rewrites a temporary snapshot and replaces the log. No third-party runtime
+packages are required.
+
 ## Quick Judge Start
 
 ### Prerequisites
@@ -27,6 +34,8 @@ executed compatibility matrix.
 Run from the repository root in Windows PowerShell:
 
 ```powershell
+Set-Location D:\Aidmap_sit
+python --version
 python -m src.cli --help
 python torture.py --iterations 5 --seed 12345 --mode basic
 ```
@@ -37,8 +46,8 @@ Default judge command:
 python torture.py --iterations 500 --seed 12345 --mode basic
 ```
 
-The harness also supports `large-value`, `max-batch`, `compaction-crash`, and
-`disk-full` modes. `large-value` and `max-batch` are each limited to five
+The harness also supports `large-value`, `max-batch`, `recovery-crash`,
+`compaction-crash`, and `disk-full` modes. Heavy modes are bounded to five
 iterations per invocation.
 
 ```powershell
@@ -46,6 +55,7 @@ python torture.py --iterations 1 --seed 12345 --mode large-value
 python torture.py --iterations 1 --seed 12345 --mode max-batch
 python torture.py --iterations 5 --seed 12345 --mode compaction-crash
 python torture.py --iterations 5 --seed 12345 --mode disk-full
+python torture.py --iterations 3 --seed 12345 --mode recovery-crash
 ```
 
 `--workdir PATH` retains run artifacts under a newly created unique
@@ -84,6 +94,35 @@ its response had not been observed at kill time; it does not prove a kill
 occurred inside a write or fsync call. For reproduction, rerun with the same
 mode, seed, and iteration count; scheduling may still alter the observed
 crash window.
+
+### Recorded performance results
+
+The following team-recorded benchmark measurements are included as reported;
+the benchmark scripts are in the repository, but a raw console transcript is
+not currently checked in:
+
+- One million live keys inserted in **54.554 seconds**.
+- One-million-key recovery in **0.809168 seconds**; all 1,000,000 keys were
+  present and sampled values matched.
+- Compaction of that all-live workload changed the file from **31,001,800**
+  to **40,000,000 bytes**. This input contained no obsolete records, so this
+  is not the churn-shrinkage acceptance test; snapshot PUT records can be
+  larger than a workload stored in batches.
+- Recovery after that compaction took **1.627460 seconds**, with all million
+  keys present.
+- Churn workload: **1,000,000 puts + 1,000,000 deletes**, zero live keys,
+  **51,003,600 → 0 bytes** after compaction (**100% reclaimed**), in
+  **166.26 seconds**; reopening afterward passed.
+- Full unit suite: **111 tests, OK**, **8.197 seconds**.
+- Basic crash torture: **500 PASS, 0 FAIL, 0 INCONCLUSIVE, 0 ERROR**, seed
+  `67890`, **194.24 seconds**.
+
+The fresh full-suite run for this integration pass also passed all 111 tests;
+unittest reported **14.590 seconds**. It ran from an isolated working
+directory so legacy import-time test scripts could not modify repository
+`.kv` files. Recovery-crash passed three iterations with seed `12345` in
+**1.64 seconds**, with the replay pause and force-kill confirmed in each.
+These are process-kill tests, not power-loss or hardware-cache tests.
 
 ## Offline setup
 
@@ -173,12 +212,43 @@ python -m src.cli check --db $db
 python -m src.cli dump --db $db
 python -m src.cli del --db $db name
 python -m src.cli get --db $db name
+@'
+PUT city Wellington
+DEL name
+'@ | Set-Content -Encoding ascii (Join-Path $demoDir "changes.txt")
+python -m src.cli batch --db $db (Join-Path $demoDir "changes.txt")
+python -m src.cli dump --db $db
+python -m src.cli compact --db $db
+python -m src.cli check --db $db
 ```
 
-Expected output includes `OK`, `Rahul`, database statistics, `OK: database
-integrity verified`, a Base64 dump line before deletion, then `OK` and
-`NOTFOUND`. Do not replace `$db` with an existing project database unless you
-intend to change it.
+Expected output includes `OK`, `Rahul`, database statistics,
+`OK: database integrity verified`, and Base64 dump lines; exact counts/bytes are
+**illustrative**, not fixed. Do not replace `$db` with an existing project
+database unless you intend to change it. After compaction, `$db` contains the
+current live state only.
+
+The size cap is a per-`Database` instance option; the CLI exposes it on `open`
+as `python -m src.cli open --db $db --max-bytes 1048576`. That command reports
+stats and closes the instance; subsequent CLI write commands do not accept a
+size-cap option. To perform capped writes, use the API:
+
+```powershell
+$env:AIDMAP_DEMO_DB = $db
+@'
+import os
+from src.database import Database
+
+with Database.open(os.environ["AIDMAP_DEMO_DB"], max_bytes=1048576) as db:
+    db.put(b"capped-key", b"capped-value")
+    print("live keys:", db.key_count())
+'@ | python -
+Remove-Item Env:AIDMAP_DEMO_DB
+```
+
+Batch operations are applied in their supplied order inside one BATCH record.
+For repeated operations on one key, the last operation determines its final
+state (a final DELETE leaves it absent).
 
 ## SERVE protocol
 
@@ -246,7 +316,8 @@ The process-local `threading.RLock` and cross-process sidecar lock serialize
 operations. Windows uses `msvcrt.locking`; POSIX uses `fcntl.flock`.
 `--max-bytes` applies to the OPEN-created Database instance; it is not stored
 in the file and therefore must be supplied again when reopening with the same
-limit. The current implementation has no million-key recovery benchmark.
+limit. The API accepts it for write instances; the CLI exposes the option on
+`open` only. Million-key benchmark results are recorded above.
 `os.fsync()` is called for record writes and tail repair; database-file
 creation is not followed by directory fsync. Compaction does fsync the
 containing directory after replacement on non-Windows systems; Windows uses
@@ -263,7 +334,12 @@ containing directory after replacement on non-Windows systems; Windows uses
   after replacement it also checks that the file shrank.
 - `disk-full`: fault-injects ENOSPC after a partial record write and checks
   for SERVE `ERR` (not ACK) and preservation of prior committed state.
-- `recovery-crash`: **NOT IMPLEMENTED** as a torture mode.
+- `recovery-crash`: seeds acknowledged PUTs and an atomic batch, appends an
+  incomplete tail, then launches recovery in a child process. The child is
+  force-killed only after it reports pausing inside record replay; a fresh
+  `open`, `check`, and `dump` is then compared with the fsynced ACK oracle.
+  The mode reports INCONCLUSIVE (never PASS) if the replay pause is not
+  observed. It is limited to five iterations.
 
 The oracle is maintained separately from the `.kv` database and fsyncs its
 events. The verifier allows an unACKed operation to have committed or not and
@@ -277,11 +353,20 @@ Example targeted commands:
 ```powershell
 python torture.py --mode compaction-crash --iterations 5 --seed 12345
 python torture.py --mode disk-full --iterations 5 --seed 12345
+python torture.py --mode recovery-crash --iterations 1 --seed 12345
 ```
 
 The disk-full mode simulates a partial-write ENOSPC error; it does not exhaust
-a real device or test `--max-bytes`. The mode is not proof of every disk-full
-failure behavior.
+a real device or test every filesystem/device failure. Separate
+`tests/test_max_bytes.py` cases exercise configured limits and partial-write
+rollback.
+
+## Offline judge demonstration
+
+Use the temporary-directory procedure in [JUDGE_DEMO.md](./JUDGE_DEMO.md).
+It exercises only disposable files and standard-library commands. Do not run
+the million-key benchmarks during the live presentation; use the recorded
+measurements above.
 
 ## Platform notes and limitations
 
