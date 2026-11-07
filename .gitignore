@@ -1,5 +1,13 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 *.kv
 *.lock
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+benchmark_*.db
+aid-map-torture-*/
+*.compact-*.tmp
