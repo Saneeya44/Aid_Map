@@ -445,10 +445,10 @@ class TortureHarnessTests(unittest.TestCase):
         errors = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             exit_code = torture.main([
-                "--seed", "123", "--mode", "compaction-crash"
+                "--seed", "123", "--mode", "recovery-crash"
             ])
         self.assertEqual(exit_code, 2)
-        self.assertIn("NOT IMPLEMENTED: mode compaction-crash", errors.getvalue())
+        self.assertIn("NOT IMPLEMENTED: mode recovery-crash", errors.getvalue())
         self.assertIn("verdict=NOT_IMPLEMENTED", output.getvalue())
 
     def test_missing_prerequisites_are_reported_without_starting_harness(self):
