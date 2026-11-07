@@ -77,6 +77,14 @@ python -m src.cli del name
 Use `--db PATH` to select another database. Existing path-first commands are also
 supported, for example `python -m src.cli put custom.kv name Anu`.
 
+The database API accepts `Database(path, max_bytes=N)` (or
+`Database.open(path, max_bytes=N)`) to cap the database file size. The limit
+accounts for complete encoded records, including record headers, and is checked
+under the database's process lock before each write. The CLI `open` command
+accepts `python -m src.cli open PATH --max-bytes N` to open with that limit;
+the setting applies to that database instance and is not stored in the database
+file. Omitting it preserves the existing unlimited behavior.
+
 ### SERVE protocol
 
 `python -m src.cli serve PATH` (or `python -m src.cli serve --db PATH`) reads

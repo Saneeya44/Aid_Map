@@ -18,8 +18,16 @@ MAX_BATCH_OPERATIONS = 10000
 
 class Database:
 
-    def __init__(self, path):
+    def __init__(self, path, max_bytes=None):
+        if max_bytes is not None and (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes < 0
+        ):
+            raise ValueError("max_bytes must be a non-negative integer")
+
         self.path = os.fspath(path)
+        self.max_bytes = max_bytes
         self.lock_path = self.path + ".lock"
         self.index = {}
         self.lock = threading.RLock()
@@ -34,8 +42,8 @@ class Database:
                 self._recover()
 
     @classmethod
-    def open(cls, path):
-        return cls(path)
+    def open(cls, path, max_bytes=None):
+        return cls(path, max_bytes=max_bytes)
 
     def _ensure_open(self):
         if self.closed:
@@ -293,7 +301,9 @@ class Database:
                 self._recover()
 
                 # Persist before updating memory
-                append_record(self.path, PUT, payload)
+                append_record(
+                    self.path, PUT, payload, max_bytes=self.max_bytes
+                )
 
                 self.index[key] = value
 
@@ -393,7 +403,9 @@ class Database:
                 if key not in self.index:
                     return False
 
-                append_record(self.path, DELETE, payload)
+                append_record(
+                    self.path, DELETE, payload, max_bytes=self.max_bytes
+                )
 
                 self.index.pop(key, None)
 
@@ -417,7 +429,9 @@ class Database:
 
                 self._recover()
 
-                append_record(self.path, BATCH, payload)
+                append_record(
+                    self.path, BATCH, payload, max_bytes=self.max_bytes
+                )
 
                 decoded = self._decode_batch(payload)
                 self._apply_operations(decoded)
