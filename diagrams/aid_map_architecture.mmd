@@ -1,0 +1,21 @@
+flowchart TD
+    User[CLI user] --> Cli[src/cli.py]
+    Harness[torture.py] -->|JSON Lines stdin| Serve[src/cli.py serve]
+    Serve --> DB[Database API]
+    Cli --> DB
+    DB --> ThreadLock[threading.RLock]
+    ThreadLock --> FileLock[src/locking.py FileLock]
+    FileLock --> Sidecar[(database.kv.lock)]
+    DB --> Recovery[src/database.py _recover]
+    Recovery --> Reader[src/storage.py read_records]
+    Reader --> Data[(database.kv append-only log)]
+    DB --> Append[src/storage.py append_record]
+    Append --> Data
+    Append --> Fsync[os.fsync]
+    DB --> Index[per-process in-memory dict index]
+    Serve -->|ACK / ERR| Harness
+    Harness --> Oracle[oracle.jsonl; flush + fsync each event]
+    Harness --> Cli
+    Cli --> Check[src/database.py check_file]
+    Check --> Verify[src/storage.py verify_records; read-only database scan]
+    Verify --> Data
