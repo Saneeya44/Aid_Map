@@ -19,6 +19,7 @@ class FakeDatabase:
     deleted_keys = []
     batch_error = None
     batch_calls = []
+    compact_calls = 0
     check_error = None
     check_result = True
 
@@ -62,6 +63,10 @@ class FakeDatabase:
         if FakeDatabase.batch_error is not None:
             raise FakeDatabase.batch_error
 
+    def compact(self):
+        FakeDatabase.compact_calls += 1
+        return 100, 25
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
@@ -72,6 +77,7 @@ class CliTests(unittest.TestCase):
         FakeDatabase.deleted_keys = []
         FakeDatabase.batch_error = None
         FakeDatabase.batch_calls = []
+        FakeDatabase.compact_calls = 0
         FakeDatabase.check_error = None
         FakeDatabase.check_result = True
         database_module = types.ModuleType("src.database")
@@ -193,6 +199,14 @@ class CliTests(unittest.TestCase):
                 ("delete", b"old"),
             ],
         )
+
+    def test_compact_reports_before_and_after_database_sizes(self):
+        exit_code, stdout, stderr = self.run_cli(["compact", "test.kv"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, "Compacted database: 100 -> 25 bytes\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(FakeDatabase.compact_calls, 1)
 
     def test_batch_preserves_spaces_in_put_value(self):
         batch_file = self.write_batch_file("PUT greeting hello from the CLI\n")

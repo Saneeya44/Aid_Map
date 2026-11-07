@@ -58,6 +58,66 @@ database_module.read_records = pause_after_recovery_scan
 database_module.Database(sys.argv[1])
 """
 
+PAUSE_DURING_COMPACTION = r"""
+import os
+import sys
+import src.storage as storage
+from src.database import Database
+
+original_replace = storage.os.replace
+original_encode_record = storage.encode_record
+
+def pause():
+    sys.stderr.write("COMPACTION_PAUSED\n")
+    sys.stderr.flush()
+    sys.stdin.readline()
+
+def pause_during_write(record_type, payload):
+    record = original_encode_record(record_type, payload)
+    pause()
+    return record
+
+def pause_at_replace(source, destination):
+    sys.stderr.write("COMPACTION_READY_TO_REPLACE\n")
+    sys.stderr.flush()
+    sys.stdin.readline()
+    original_replace(source, destination)
+    sys.stderr.write("COMPACTION_REPLACED\n")
+    sys.stderr.flush()
+    sys.stdin.readline()
+
+if sys.argv[2] == "write":
+    storage.encode_record = pause_during_write
+else:
+    storage.os.replace = pause_at_replace
+with Database(sys.argv[1]) as database:
+    database.compact()
+"""
+
+PAUSE_BEFORE_PARTIAL_ENOSPC = r"""
+import errno
+import sys
+import src.storage as storage
+from src.cli import main
+
+original_write = storage.os.write
+failed = False
+
+def partial_then_enospc(fd, data):
+    global failed
+    if not failed:
+        failed = True
+        data = bytes(data)
+        written = original_write(fd, data[:max(1, len(data) // 2)])
+        sys.stderr.write("PARTIAL_WRITE_BEFORE_ENOSPC\n")
+        sys.stderr.flush()
+        raise OSError(errno.ENOSPC, "simulated disk full")
+    return original_write(fd, data)
+
+storage.os.write = partial_then_enospc
+raise SystemExit(main(["serve", sys.argv[1]]))
+"""
+
 
 def b64(value):
     import base64
@@ -130,6 +190,34 @@ class TortureScenarioTests(unittest.TestCase):
         )
         process = subprocess.Popen(
             [sys.executable, "-u", "-c", script, self.database_path],
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=environment,
+        )
+        paused_process = PausedProcess(process)
+        self.addCleanup(paused_process.force_kill)
+        return paused_process
+
+    def start_compaction_process(self, phase):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = (
+            PROJECT_ROOT
+            if not environment.get("PYTHONPATH")
+            else PROJECT_ROOT + os.pathsep + environment["PYTHONPATH"]
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                PAUSE_DURING_COMPACTION,
+                self.database_path,
+                phase,
+            ],
             cwd=PROJECT_ROOT,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -336,6 +424,84 @@ class TortureScenarioTests(unittest.TestCase):
         with open(self.database_path, "rb") as file:
             contents = file.read()
         self.assertFalse(contents.endswith(b"KV"))
+
+    def test_kill_before_compaction_replace_keeps_original_database(self):
+        with Database(self.database_path) as database:
+            database.put(b"updated", b"old" * 100)
+            database.put(b"removed", b"gone")
+            database.put(b"updated", b"new")
+            database.delete(b"removed")
+            expected = {b"updated": b"new"}
+
+        process = self.start_compaction_process("before")
+        self.assertEqual(process.read_stderr(), "COMPACTION_READY_TO_REPLACE")
+        process.force_kill()
+
+        with Database(self.database_path) as recovered:
+            self.assertEqual(dict(recovered.items()), expected)
+            self.assertIs(recovered.check(), True)
+
+    def test_kill_after_compaction_replace_keeps_compacted_database(self):
+        with Database(self.database_path) as database:
+            database.put(b"updated", b"old" * 100)
+            database.put(b"removed", b"gone")
+            database.put(b"updated", b"new")
+            database.delete(b"removed")
+            expected = {b"updated": b"new"}
+
+        size_before = os.path.getsize(self.database_path)
+        process = self.start_compaction_process("after")
+        self.assertEqual(process.read_stderr(), "COMPACTION_READY_TO_REPLACE")
+        process.process.stdin.write("\n")
+        process.process.stdin.flush()
+        self.assertEqual(process.read_stderr(), "COMPACTION_REPLACED")
+        process.force_kill()
+
+        self.assertLess(os.path.getsize(self.database_path), size_before)
+        with Database(self.database_path) as recovered:
+            self.assertEqual(dict(recovered.items()), expected)
+            self.assertIs(recovered.check(), True)
+
+    def test_kill_during_compaction_snapshot_write_keeps_original_database(self):
+        with Database(self.database_path) as database:
+            database.put(b"updated", b"old" * 100)
+            database.put(b"removed", b"gone")
+            database.put(b"updated", b"new")
+            database.delete(b"removed")
+            expected = {b"updated": b"new"}
+
+        original_size = os.path.getsize(self.database_path)
+        process = self.start_compaction_process("write")
+        self.assertEqual(process.read_stderr(), "COMPACTION_PAUSED")
+        process.force_kill()
+
+        self.assertEqual(os.path.getsize(self.database_path), original_size)
+        with Database(self.database_path) as recovered:
+            self.assertEqual(dict(recovered.items()), expected)
+            self.assertIs(recovered.check(), True)
+
+    def test_partial_enospc_returns_err_and_recovers_committed_state(self):
+        with Database(self.database_path) as database:
+            database.put(b"committed", b"before")
+
+        process = self.start_paused_process(PAUSE_BEFORE_PARTIAL_ENOSPC)
+        process.process.stdin.write(json_request({
+            "id": "disk-full-partial",
+            "op": "put",
+            "key": b64(b"uncommitted"),
+            "value": b64(b"value"),
+        }))
+        process.process.stdin.flush()
+        self.assertEqual(process.read_stderr(), "PARTIAL_WRITE_BEFORE_ENOSPC")
+        self.assertEqual(
+            process.process.stdout.readline(),
+            "ERR disk-full-partial [Errno 28] simulated disk full\n",
+        )
+        process.force_kill()
+
+        with Database(self.database_path) as recovered:
+            self.assertEqual(recovered.get(b"committed"), b"before")
+            self.assertIsNone(recovered.get(b"uncommitted"))
 
 
 if __name__ == "__main__":

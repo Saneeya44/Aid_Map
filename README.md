@@ -1,10 +1,10 @@
 # Aid_Map
 
 Aid_Map is a small Python append-only key-value database project for the
-"Kill It and Prove It" hackathon. This README describes the current code; it
-does not certify compliance with an official challenge statement that is not
-included in this repository. See [REQUIREMENTS_CHECKLIST.md](./REQUIREMENTS_CHECKLIST.md)
-for the evidence and blocked requirements.
+"Kill It and Prove It" hackathon. This README describes current code and its
+known limitations; it is not a blanket claim that every crash scenario passes.
+See [REQUIREMENTS_CHECKLIST.md](./REQUIREMENTS_CHECKLIST.md) for evidence and
+remaining gaps.
 
 ## Quick Judge Start
 
@@ -37,12 +37,15 @@ Default judge command:
 python torture.py --iterations 500 --seed 12345 --mode basic
 ```
 
-The harness also supports `large-value` and `max-batch` modes (each limited to
-five iterations per invocation):
+The harness also supports `large-value`, `max-batch`, `compaction-crash`, and
+`disk-full` modes. `large-value` and `max-batch` are each limited to five
+iterations per invocation.
 
 ```powershell
 python torture.py --iterations 1 --seed 12345 --mode large-value
 python torture.py --iterations 1 --seed 12345 --mode max-batch
+python torture.py --iterations 5 --seed 12345 --mode compaction-crash
+python torture.py --iterations 5 --seed 12345 --mode disk-full
 ```
 
 `--workdir PATH` retains run artifacts under a newly created unique
@@ -113,6 +116,7 @@ on other platforms. A path's `.lock` sidecar is used for cross-process locking.
 | DUMP | `python -m src.cli dump --db PATH` | Prints sorted live entries as Base64 |
 | CHECK | `python -m src.cli check --db PATH` | Strictly scans for integrity errors without recovering or repairing the data file |
 | SERVE | `python -m src.cli serve --db PATH` | Reads JSONL requests until EOF and emits ACK/ERR lines |
+| COMPACT | `python -m src.cli compact --db PATH` | Atomically replaces the log with a snapshot of live keys |
 
 Equivalent legacy path-first forms include:
 
@@ -125,29 +129,27 @@ python -m src.cli open PATH
 python -m src.cli dump PATH
 python -m src.cli check PATH
 python -m src.cli serve PATH
+python -m src.cli compact PATH
 ```
 
 A batch file contains one operation per nonblank line. PUT values may contain
 spaces after the key:
 
-
-Replace that entire conflict section, including the `<<<<<<<`, `=======`, and `>>>>>>>` markers, with the following:
-
-<WritingBlock id="68324" variant="standard">A batch file contains one operation per nonblank line. PUT values may contain spaces after the key:
-
 ```text
 PUT name Ada Lovelace
 DEL old-name
-The database API accepts `Database(path, max_bytes=N)` (or
-`Database.open(path, max_bytes=N)`) to cap the database file size. The limit
-accounts for complete encoded records, including record headers, and is checked
-under the database's process lock before each write. The CLI `open` command
-accepts `python -m src.cli open PATH --max-bytes N` to open with that limit;
-the setting applies to that database instance and is not stored in the database
-file. Omitting it preserves the existing unlimited behavior.
+```
 
-### SERVE protocol
->>>>>>> origin/feature/max-bytes
+For an instance-specific database size limit, OPEN accepts
+`python -m src.cli open PATH --max-bytes N` (or
+`python -m src.cli open --db PATH --max-bytes N`). The API also accepts
+`Database(path, max_bytes=N)` or `Database.open(path, max_bytes=N)`. The limit
+counts complete encoded records including their headers, is checked while
+holding the database process lock, and is not persisted in the database file.
+If a new record would exceed the limit, that append is rejected before writing;
+if an OS write fails after a partial append, the implementation attempts to
+truncate back to the original length and fsync. Omitting the option preserves
+unlimited size.
 
 The engine limits keys to 1-1024 bytes, values to at most 1 MiB, and batches
 to at most 10,000 operations. The CLI's text operands are UTF-8; use SERVE for
@@ -214,6 +216,19 @@ type, four-byte payload length, and four-byte CRC-32. The checksum covers the
 version, record type, and payload, but not the magic or payload-length field.
 Record types are PUT (1), DELETE (2), and BATCH (3).
 
+### Compaction
+
+Run `python -m src.cli compact PATH` (or `python -m src.cli compact --db PATH`)
+to reclaim space used by obsolete records and deleted-key tombstones.
+Compaction takes the process lock, recovers the current live index, writes a
+snapshot of live PUT records to a temporary file in the database directory,
+flushes and fsyncs that file, then atomically replaces the database with
+`os.replace`. On non-Windows systems it also fsyncs the containing directory
+after replacement. A kill before replacement leaves the original database
+authoritative; after replacement the compacted log is authoritative. A
+temporary file left by a force-kill is not referenced during recovery and is
+ignored (automatic cleanup of every orphan is not guaranteed).
+
 PUT payloads contain a two-byte key length, key, then value. DELETE payloads
 contain a two-byte key length and key. BATCH payloads start with a four-byte
 operation count and contain typed operations with two-byte key lengths; PUT
@@ -228,19 +243,27 @@ start of that record and fsynced; invalid headers/checksums raise errors.
 prints each live entry as `key=<Base64> value=<Base64>`.
 
 The process-local `threading.RLock` and cross-process sidecar lock serialize
-operations. Windows uses `msvcrt.locking`; POSIX uses `fcntl.flock`. The
-implementation currently has no compaction, configured maximum database
-size, or million-key recovery benchmark. `os.fsync()` is called for record
-writes and tail repair; no directory fsync is performed for newly created
-files.
+operations. Windows uses `msvcrt.locking`; POSIX uses `fcntl.flock`.
+`--max-bytes` applies to the OPEN-created Database instance; it is not stored
+in the file and therefore must be supplied again when reopening with the same
+limit. The current implementation has no million-key recovery benchmark.
+`os.fsync()` is called for record writes and tail repair; database-file
+creation is not followed by directory fsync. Compaction does fsync the
+containing directory after replacement on non-Windows systems; Windows uses
+`os.replace` but has no corresponding directory fsync call.
 
-## Torture harness modes
+## Torture harness
 
 - `basic`: concurrent seeded PUT/DELETE/BATCH requests, force-kill, then
   separate `open`, `check`, and `dump` subprocesses and oracle verification.
 - `large-value`: 1 MiB PUT/overwrite/delete cases; maximum five iterations.
 - `max-batch`: 10,000-operation mixed batch; maximum five iterations.
-- `recovery-crash`, `compaction-crash`, and `disk-full`: **NOT IMPLEMENTED**.
+- `compaction-crash`: kills a subprocess during snapshot-record generation,
+  before replacement, or after replacement, then checks recovered live data;
+  after replacement it also checks that the file shrank.
+- `disk-full`: fault-injects ENOSPC after a partial record write and checks
+  for SERVE `ERR` (not ACK) and preservation of prior committed state.
+- `recovery-crash`: **NOT IMPLEMENTED** as a torture mode.
 
 The oracle is maintained separately from the `.kv` database and fsyncs its
 events. The verifier allows an unACKed operation to have committed or not and
@@ -248,6 +271,17 @@ may report INCONCLUSIVE where the history cannot justify a binary verdict.
 Heavy modes do not claim a kill during a write/fsync merely because the server
 process remained alive. The harness uses temporary paths by default and does
 not use the project-root `.kv` databases.
+
+Example targeted commands:
+
+```powershell
+python torture.py --mode compaction-crash --iterations 5 --seed 12345
+python torture.py --mode disk-full --iterations 5 --seed 12345
+```
+
+The disk-full mode simulates a partial-write ENOSPC error; it does not exhaust
+a real device or test `--max-bytes`. The mode is not proof of every disk-full
+failure behavior.
 
 ## Platform notes and limitations
 
@@ -259,7 +293,8 @@ for network filesystems is documented. Avoid running broad legacy tests
 without confirming their database paths; use temporary paths for manual or
 crash testing.
 
-The implementation must not be described as fully crash-safe or as meeting
-the judging criteria solely because CLI/harness tests pass. Consult
-[REQUIREMENTS_CHECKLIST.md](./REQUIREMENTS_CHECKLIST.md) and obtain the exact
-official scenario and performance requirements before making those claims.
+The verifier requires ACKed writes and allows an eligible unACKed request to
+have committed or not; it reports INCONCLUSIVE rather than guessing when
+history cannot establish a safe serialized result. Neither CLI tests nor
+torture-mode success alone proves all crash-safety requirements. See
+[REQUIREMENTS_CHECKLIST.md](./REQUIREMENTS_CHECKLIST.md) for known gaps.

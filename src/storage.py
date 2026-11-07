@@ -1,5 +1,6 @@
 import os
 import struct
+import tempfile
 import zlib
 
 # Record format constants
@@ -70,6 +71,43 @@ def append_record(path, record_type, payload, max_bytes=None):
 
     finally:
         os.close(fd)
+
+
+def replace_records_atomically(path, records):
+    directory = os.path.dirname(os.path.abspath(path))
+    prefix = os.path.basename(path) + ".compact-"
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".tmp",
+        dir=directory,
+    )
+
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            for record_type, payload in records:
+                remaining = memoryview(encode_record(record_type, payload))
+                while remaining:
+                    written = file.write(remaining)
+                    if written is None or written == 0:
+                        raise OSError("Unable to write compacted database")
+                    remaining = remaining[written:]
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary_path, path)
+
+        if os.name != "nt":
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _read_records(file, repair_incomplete):
